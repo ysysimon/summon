@@ -3,6 +3,7 @@ import json
 import math
 import os
 import time
+import random
 
 import numpy as np
 import open3d as o3d
@@ -23,10 +24,19 @@ if __name__ == "__main__":
     parser.add_argument("--vertices_path", type=str)
     parser.add_argument("--contact_labels_path", type=str)
     parser.add_argument("--output_dir", type=str)
+    parser.add_argument("--models_dir", default="3D_Future/models")
+    parser.add_argument("--faces_path", default=os.path.join(os.path.dirname(__file__), "mesh_ds", "mesh_2.obj"))
+    parser.add_argument("--frame_indices", help="NPY source-frame indices corresponding to contact predictions")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", choices=["cuda", "cpu"], default=None)
     parser.add_argument("--input_probability",
                         action='store_true', 
                         default=False)
     args = parser.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    o3d.utility.random.seed(args.seed)
     
     sequence_name = args.sequence_name
     output_dir = args.output_dir
@@ -40,14 +50,22 @@ if __name__ == "__main__":
     
     label_names, color_coding_rgb = read_mpcat40()
     
-    contact_labels = contact_labels.squeeze()
+    contact_labels = contact_labels.reshape(contact_labels.shape[0], -1)
+    frame_indices = (np.load(args.frame_indices) if args.frame_indices
+                     else np.arange(contact_labels.shape[0]) * 8)
+    if (frame_indices.ndim != 1 or len(frame_indices) != len(contact_labels)
+            or not np.issubdtype(frame_indices.dtype, np.integer)
+            or np.any(frame_indices < 0) or np.any(frame_indices >= len(vertices))):
+        raise ValueError("Invalid contact-to-source frame mapping")
+    if contact_labels.shape[1] != vertices.shape[1]:
+        raise ValueError("Contact and mesh vertex counts do not match")
     
     # Map contact labels to predicted subset
     vertices_down = []
     contact_labels_mapped = []
     for frame in range(contact_labels.shape[0]):
         contact_labels_mapped.append(pred_subset_to_mpcat40[contact_labels[frame]])
-        vertices_down.append(vertices[frame * 8])
+        vertices_down.append(vertices[frame_indices[frame]])
     vertices = np.array(vertices_down)
     contact_labels = np.array(contact_labels_mapped)
     
@@ -73,7 +91,9 @@ if __name__ == "__main__":
     opt_classes_pen_weight = params["opt_classes_pen_weight"]
     
     # Get cuda
-    if torch.cuda.is_available():
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
+    if torch.cuda.is_available() and args.device != "cpu":
         print("Using cuda")
         device = torch.device("cuda")
     else:
@@ -83,7 +103,7 @@ if __name__ == "__main__":
     print()
     
     # Create human SDF
-    human_meshes = read_sequence_human_mesh(args.vertices_path)
+    human_meshes = read_sequence_human_mesh(args.vertices_path, args.faces_path)
     merged_human_meshes = merge_meshes(human_meshes)
     grid_dim = 256
     human_sdf_base_path = os.path.join(output_dir, sequence_name, "human")
@@ -205,7 +225,7 @@ if __name__ == "__main__":
         cluster_points_tensor = torch.Tensor(cluster_points).float().to(device)
         obj_idx = objects_indices[i]
         obj_class_str = label_names[obj_c]
-        obj_class_path = os.path.join("3D_Future", "models", obj_class_str)
+        obj_class_path = os.path.join(args.models_dir, obj_class_str)
         print("Object class", obj_class_str, "Object index", obj_idx, "Num points", cluster_points.shape[0])
         print()
         cluster_base_path = os.path.join(output_dir, sequence_name, "fit_best_obj", obj_class_str, str(obj_idx))
@@ -227,7 +247,7 @@ if __name__ == "__main__":
         best_obj_loss = float("inf")
         best_obj_id = ""
         # For each candidate object
-        for obj_dir in os.listdir(obj_class_path):
+        for obj_dir in sorted(os.listdir(obj_class_path)):
             obj_path = os.path.join(obj_class_path, obj_dir, "raw_model.obj")
             print("Trying obj at", obj_path)
             obj_mesh = o3d.io.read_triangle_mesh(obj_path)

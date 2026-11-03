@@ -1,4 +1,5 @@
 import os
+import random
 import numpy as np
 import argparse
 import torch
@@ -13,6 +14,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="")
     parser.add_argument("data_dir", type=str,
                         help="path to POSA_temp dataset dir")
+    parser.add_argument("--mesh_ds_dir", default=os.path.join(os.path.dirname(__file__), "..", "mesh_ds"))
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", choices=["cuda"], default="cuda")
     parser.add_argument("--load_model", type=str, default="../training/model_ckpt/epoch_0045.pt",
                         help="checkpoint path to load")
     parser.add_argument("--encoder_mode", type=int, default=1,
@@ -35,6 +39,12 @@ if __name__ == '__main__':
 
     # Parse arguments and assign directories
     args = parser.parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError("ContactFormer requires a CUDA device in this integration")
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
     args_dict = vars(args)
 
     data_dir = args_dict['data_dir']
@@ -55,20 +65,20 @@ if __name__ == '__main__':
     num_obj_classes = 8
     # For fix_ori
     fix_ori = True
-    ds_weights = torch.tensor(np.load("./support_files/downsampled_weights.npy"))
+    ds_weights = torch.tensor(np.load(os.path.join(os.path.dirname(__file__), "support_files", "downsampled_weights.npy")))
     associated_joints = torch.argmax(ds_weights, dim=1)
     os.makedirs(output_dir, exist_ok=True)
 
     seq_name_list = []
-    vertices_file_list = os.listdir(data_dir)
+    vertices_file_list = sorted(f for f in os.listdir(data_dir) if f.endswith("_verts_can.npy"))
     seq_name_list = [file_name.split('_verts_can')[0] for file_name in vertices_file_list]
     list_set = set(seq_name_list)
-    seq_name_list = list(list_set)
+    seq_name_list = sorted(list_set)
 
     # Load in model checkpoints and set up data stream
     model = ContactFormer(seg_len=max_frame, encoder_mode=encoder_mode, decoder_mode=decoder_mode,
                           n_layer=n_layer, n_head=n_head, f_vert=f_vert, dim_ff=dim_ff, d_hid=512,
-                          posa_path=posa_path).to(device)
+                          posa_path=posa_path, mesh_ds_dir=args.mesh_ds_dir).to(device)
     model.eval()
     checkpoint = torch.load(ckpt_path)
     model.load_state_dict(checkpoint['model_state_dict'])

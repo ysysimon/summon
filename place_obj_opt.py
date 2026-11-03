@@ -40,7 +40,7 @@ def penetration_loss(
     neg_dists_mask = signed_dists.lt(pen_thresh).flatten()
     neg_dists = signed_dists[neg_dists_mask] ** 2
     if len(neg_dists) == 0:
-        pen_loss = torch.tensor(0.0)
+        pen_loss = signed_dists.new_zeros(())
     else:
         pen_loss = weight * neg_dists.sum()
         

@@ -121,7 +121,7 @@ Returns:
     index lookup list of contact label names; index nmupy array of rgb colors
 
 """
-def read_mpcat40(path="mpcat40.tsv"):
+def read_mpcat40(path=os.path.join(os.path.dirname(__file__), "mpcat40.tsv")):
     import pandas as pd
     mpcat40 = pd.read_csv(path, sep='\t')
     label_names = list(mpcat40['mpcat40'])

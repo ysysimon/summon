@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "assets": {
+    "01fe3767-6f21-49cf-b8da-e16b53267dc8": {
+      "source_sha256": "f7321b780d0b382535e50a1d007852ed874febb450cc026c9a3b41dd84e15182",
+      "yaw_degrees": 180.0,
+      "seat_height": 0.46,
+      "height_band": 0.035
+    },
+    "0a79b3eb-03c5-3df4-9a60-b4b99c443d87": {
+      "source_sha256": "fbcb38c77c62251dffe7dc64385ae5d7ac85cdb8cb578ef4c2a69ac85b9271a7",
+      "yaw_degrees": 180.0,
+      "seat_height": 0.44,
+      "height_band": 0.045
+    },
+    "0f92470c-b703-49fb-b317-fb3e570363aa": {
+      "source_sha256": "4b0c914826bb3314daf3f32109bd52185ed0f35be5876582441865fea31d36ab",
+      "yaw_degrees": 180.0,
+      "seat_height": 0.91,
+      "height_band": 0.055
+    },
+    "252c2950-6bad-4bf7-a557-76b1a08f7394": {
+      "source_sha256": "4bbbade37cd077abb5847d217ce59dab898e75839d6fa81693edd11cd67a81f9",
+      "yaw_degrees": 180.0,
+      "seat_height": 0.43,
+      "height_band": 0.035
+    },
+    "4c54b216-fa90-4f66-8a03-ea59ee2be6ae": {
+      "source_sha256": "ed22789e70a2782bfbd03b43c865c9c61db14882ed0ddd197e67f72d34593ed7",
+      "yaw_degrees": 90.0,
+      "seat_height": 0.51,
+      "height_band": 0.055
+    },
+    "5149c843-f441-4589-a67f-e6ac7caf021e": {
+      "source_sha256": "043cc6c002d5c972b7a6e1a14a05f631f6d09e6c7fed608d926f1576e45f76d5",
+      "yaw_degrees": 180.0,
+      "seat_height": 0.48,
+      "height_band": 0.065
+    },
+    "6f09d6a0-dcd6-472a-9793-bafc17a8486f": {
+      "source_sha256": "381d742e669fec478d9c70551af4b78e3501f1b6d5a0376f0e84209523f7a020",
+      "yaw_degrees": 180.0,
+      "seat_height": 0.49,
+      "height_band": 0.06
+    },
+    "925bc907-2909-43e4-a988-261bf098e3be": {
+      "source_sha256": "6296157e2476061a4275f373c627f4effd72f1171283c24032b6c4f4b06aca96",
+      "yaw_degrees": 180.0,
+      "seat_height": 0.495,
+      "height_band": 0.045
+    }
+  }
+}

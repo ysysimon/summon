@@ -11,7 +11,7 @@ import numpy as np
 import trimesh
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from chair_support.collision import collision_check
+from chair_support.collision import collision_check, collision_checks
 from chair_support import multi_scene as scene
 
 
@@ -59,7 +59,7 @@ def set_up_candidate(ctx, root, name, center, loss=1.0, size=(0.1, 0.1, 0.1), an
         qualified=verified["status"] == "certified_below_limit",
         source_asset=str(src / "asset.json"),
         source_geometry_sha256=scene.sha256(src / "mesh.obj"),
-        rejection_reasons=[],
+        rejection_reasons=collision_checks(verified),
     )
 
 
@@ -82,6 +82,48 @@ class MultiSceneTests(unittest.TestCase):
 
     def assemble(self, budget=64):
         return scene.assemble_scene(self.ctx, self.dirs, self.output, budget, "motion+events")
+
+    def rejected_pool(self, instance, reasons_by_id):
+        fit = self.root / instance
+        candidates = [dict(id=k, qualified=False, rejection_reasons=v) for k, v in reasons_by_id.items()]
+        scene.write_atomic(
+            fit / "fit_result.json",
+            dict(
+                status="no_valid_candidate",
+                candidates=candidates,
+                rejection_reasons=["no_candidate_passed_geometry_acceptance"]
+                if candidates
+                else ["no_support_evidence"],
+            ),
+        )
+        self.dirs[instance] = fit
+        scene.seal_instance(self.ctx, fit, "motion+events", instance)
+
+    def test_entire_required_pool_rejected_even_with_other_unknowns(self):
+        reasons = {
+            "wrong_height": ["left_gluteus:insufficient_support", "visit_support_unverified"],
+            "intrusion": ["full_motion_penetration", "collision_depth_undetermined"],
+        }
+        self.rejected_pool("A", reasons)
+        self.rejected_pool("B", {"bad_mesh": ["support_geometry_unverified: missing seat surface"]})
+        result = self.assemble()
+        self.assertEqual(result["status"], "no_valid_scene")
+        a, b = (result["rejected_instances"][k] for k in ("A", "B"))
+        self.assertEqual(a["candidates"], reasons)
+        self.assertEqual(a["candidate_states"], dict.fromkeys(reasons, "measured_rejection"))
+        self.assertEqual((a["status"], b["status"]), ("no_valid_candidate", "undetermined"))
+
+    def test_unknown_alternative_keeps_possible_combination_open(self):
+        reasons = {"wrong_heading": ["chair_heading_mismatch"], "timeout": ["collision_depth_undetermined"]}
+        self.rejected_pool("A", reasons)
+        self.rejected_pool("B", {})
+        result = self.assemble()
+        self.assertEqual(result["status"], "undetermined")
+        self.assertEqual(
+            result["rejected_instances"]["A"]["candidate_states"],
+            {"wrong_heading": "measured_rejection", "timeout": "undetermined"},
+        )
+        self.assertEqual(result["rejected_instances"]["B"]["reasons"], ["no_support_evidence"])
 
     def test_empty_scene_and_two_disjoint_seats_with_revisit(self):
         empty = self.assemble()

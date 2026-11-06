@@ -18,7 +18,7 @@ from scipy.spatial import ConvexHull, QhullError
 import trimesh
 
 from .collision import ClosedSolid, MAXIMUM_PENETRATION, collision_check
-from .engine import read_asset, sha256
+from .engine import REGIONS, read_asset, sha256
 from .geometry_audit import GeometryAudit, NUMERIC_MARGIN, children, prepare_geometry
 
 
@@ -491,6 +491,22 @@ def cached_outcome(path, key):
     return None
 
 
+def has_measured_rejection(reasons):
+    """One measured failed constraint rules out this candidate even when another is unverified."""
+    placement_or_collision = {
+        "chair_not_grounded",
+        "chair_heading_mismatch",
+        "backrest_not_behind_pelvis",
+        "full_motion_penetration",
+    }
+    support = {"insufficient_support", "insufficient_seat_coverage", "seat_penetration"}
+    for reason in reasons:
+        region, sep, code = reason.partition(":")
+        if reason in placement_or_collision or (sep and region in REGIONS and code in support):
+            return True
+    return False
+
+
 def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, cache_dir=None):
     """Combine already world-posed candidates. All human checks use the full source grid."""
     if type(max_combinations) is not int or max_combinations < 1:
@@ -511,7 +527,6 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
         rejection_reasons=[],
     )
     missing = {}
-    unverified = False
     for instance, dir_path in sorted(fit_dirs.items()):
         root = Path(dir_path).resolve()
         seal = binding(root, inputs, instance)
@@ -527,17 +542,23 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
         pool = sorted((c for c in candidates if c.get("qualified")), key=lambda c: (c["loss"], c["id"]))
         if not pool:
             failures = {c["id"]: c.get("rejection_reasons", []) for c in candidates}
+            states = {
+                asset_id: "measured_rejection" if has_measured_rejection(reasons) else "undetermined"
+                for asset_id, reasons in failures.items()
+            }
+            all_ruled_out = bool(states) and all(state == "measured_rejection" for state in states.values())
             missing[instance] = dict(
-                fitting_status=fit["status"], reasons=fit.get("rejection_reasons", []), candidates=failures
-            )
-            reasons = fit.get("rejection_reasons", []) + [r for row in failures.values() for r in row]
-            unverified |= any(
-                "undetermined" in r or "unverified" in r or r == "no_support_evidence" for r in reasons
+                fitting_status=fit["status"],
+                reasons=fit.get("rejection_reasons", []),
+                candidates=failures,
+                candidate_states=states,
+                status="no_valid_candidate" if all_ruled_out else "undetermined",
             )
         ordered.append(pool)
     if missing:
         report.update(rejection_reasons=["no_qualified_candidate_for_instance"], rejected_instances=missing)
-        if unverified:
+        # A combination must include one candidate from EVERY required instance.
+        if not any(row["status"] == "no_valid_candidate" for row in missing.values()):
             report["status"] = "undetermined"
         write_atomic(output / "scene_result.json", report)
         return report

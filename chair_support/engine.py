@@ -79,7 +79,7 @@ def contiguous_runs(mask):
     return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
 
 
-def motion_context(manifest_path, vertices_path, contacts_path, indices_path, output):
+def motion_context(manifest_path, vertices_path, contacts_path, indices_path, output, visits=None, locations=None):
     p = Path(manifest_path)
     manifest = json.loads(p.read_text(encoding="utf-8"))
     data = manifest.get("fitting_data", manifest)
@@ -112,9 +112,16 @@ def motion_context(manifest_path, vertices_path, contacts_path, indices_path, ou
     smooth = max(1, int(round(fps * .1)))
     velocity = (np.gradient(uniform_filter1d(pelvis, smooth, axis=0, mode="nearest"), axis=0) * fps
                 if len(pelvis) > 1 else np.zeros_like(pelvis))
-    chair_count = (labels == 3).sum(axis=1)
+    chair_contacts = labels == 3
+    if visits is not None:
+        from .multi_fit import instance_contacts, visit_masks
+        interaction_ids, support_ids = visit_masks(visits, len(dense))
+        chair_contacts = instance_contacts(world, labels, source_indices, interaction_ids, visits[0]["instance_id"], locations)
+    chair_count = chair_contacts.sum(axis=1)
     phase_count = np.interp(np.arange(len(dense)), source_indices, chair_count)
     conditions = {"insufficient_chair_contacts": phase_count >= DEFAULTS["min_chair_vertices"]}
+    if visits is not None:
+        conditions["outside_instance_support"] = support_ids >= 0
     angles = {}; thigh_angles={}
     for side in ("Left", "Right"):
         thigh = j[side + "Shin"] - j[side + "Leg"]
@@ -141,9 +148,15 @@ def motion_context(manifest_path, vertices_path, contacts_path, indices_path, ou
     regions = body_regions(ctx)
     anchors, invalid = collect_support_samples(ctx, regions, np.flatnonzero(candidate))
     valid_frames = np.array([sample[0] for sample in anchors[REGIONS[0]]], dtype=int)
+    gap_limits = {region: DEFAULTS["gluteus_gap"] if "gluteus" in region else DEFAULTS["thigh_gap"]
+                  for region in REGIONS}
     selected, proxy = select_support(valid_frames, weights, anchors, pelvis, forward,
-        {region: DEFAULTS["gluteus_gap"] if "gluteus" in region else DEFAULTS["thigh_gap"]
-         for region in REGIONS}, DEFAULTS["maximum_penetration"])
+                                     gap_limits, DEFAULTS["maximum_penetration"])
+    if visits is not None:
+        from .multi_fit import retain_return_visits
+        selected, visit_evidence = retain_return_visits(visits, selected, valid_frames, support_ids,
+            anchors, weights, pelvis, forward, gap_limits, DEFAULTS["maximum_penetration"])
+        ctx.update(visits=visits, instance_contacts=chair_contacts)
     selected_mask = np.zeros(len(dense), bool); selected_mask[selected] = True
     valid_mask = np.zeros(len(dense), bool); valid_mask[valid_frames] = True
     reasons = []
@@ -164,6 +177,8 @@ def motion_context(manifest_path, vertices_path, contacts_path, indices_path, ou
                  floor_height=floor, selection_proxy=proxy, selection_reasons=reasons,
                  weight_semantics="heuristic evidence strength, not probability; no velocity or duration rejection",
                  contact_phase_interpolation="counts only; original contact labels remain unchanged", thresholds=DEFAULTS)
+    if visits is not None:
+        phase["visits"] = visit_evidence
     write_json(output / "phase.json", phase)
     np.savez_compressed(output/"phase_evidence.npz",source_frame_indices=np.arange(len(dense)),
         pelvis_speed=speed,pelvis_vertical_speed=vertical_speed,
@@ -343,7 +358,10 @@ def contact_roles(ctx, regions, output):
     for name in ("left_distal_thigh","right_distal_thigh"):
         distal[regions[name]]=True
     for row,frame in enumerate(ctx["indices"]):
-        ids=np.flatnonzero(ctx["labels"][row]==3)
+        if "instance_contacts" in ctx:
+            ids=np.flatnonzero(ctx["instance_contacts"][row])
+        else:
+            ids=np.flatnonzero(ctx["labels"][row]==3)
         if not len(ids): continue
         v=np.asarray(ctx["dense"][frame]);normals=vertex_normals(v,ctx["faces"])
         points=np.asarray(ctx["world"][frame,ids]);_,nearest=cKDTree(v).query(points)
@@ -478,6 +496,8 @@ def placement_checks(mesh, parts, pelvis, body_forward, chair_forward, floor):
 def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
     meta, mesh, parts = read_asset(path)
     asset_id = str(meta.get("id", meta.get("asset_id", Path(path).parent.name)))
+    if not asset_id or asset_id in (".", "..") or Path(asset_id).name != asset_id:
+        raise ValueError("Invalid candidate asset identifier")
     directory = output / "candidates" / asset_id
     directory.mkdir(parents=True, exist_ok=True)
     seat = ray_scene(mesh.vertices, mesh.faces[parts["seat_face_indices"]])
@@ -707,6 +727,11 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
             ctx["forward"][ctx["support_frames"]],np.array([0.,1.,0.])@r.T,ctx["floor"])
         reasons.extend(placement_reasons)
         metrics=dict(support=support,scale=float(scale),geometry=geometry.summary(),**placement)
+        if "visits" in ctx:
+            from .multi_fit import evaluate_visits
+            metrics["visits"] = evaluate_visits(ctx["phase"]["visits"], worst_support)
+            if not all(visit["verified"] for visit in metrics["visits"]):
+                reasons.append("visit_support_unverified")
         worst_frame=None;collision=None
         if not reasons:
             print("Full-frame collision check",asset_id,"round",validation_round,flush=True)
@@ -819,6 +844,8 @@ def main(argv=None):
     parser.add_argument("--models-dir",type=Path)
     parser.add_argument("--candidate-source",choices=["cad","infinigen"],default="cad")
     parser.add_argument("--assets-manifest",type=Path)
+    parser.add_argument("--instance-visits",type=Path,help="This instance's inferred visits on the complete source grid")
+    parser.add_argument("--candidate-cache",type=Path,help="Reusable completed multi-instance candidate checkpoints")
     parser.add_argument("--output",required=True,type=Path)
     parser.add_argument("--estimate-only",action="store_true")
     parser.add_argument("--max-candidates",type=int,choices=(1,2,3),default=3)
@@ -832,11 +859,26 @@ def main(argv=None):
         Path(__file__).parent/"selection.py",Path(__file__).parent/"geometry_audit.py"]
     report["implementation_sha256"]={str(path.relative_to(Path(__file__).parent)):sha256(path) for path in implementation_files if path.is_file()}
     try:
-        ctx=motion_context(args.geometry,args.vertices_path,args.contacts,args.frame_indices,output)
+        assignment=json.loads(args.instance_visits.read_text(encoding="utf-8")) if args.instance_visits else None
+        visits=assignment["events"] if assignment is not None else None
+        cache=None
+        if assignment is not None:
+            from .multi_fit import CandidateCache, valid_name
+            import platform
+            import importlib.metadata
+            report["instance_id"]=valid_name(assignment["instance_id"])
+            if any(visit["instance_id"] != report["instance_id"] for visit in visits):
+                raise ValueError("Mismatched instance in visit assignment")
+            report["implementation_sha256"]["multi_fit.py"]=sha256(Path(__file__).with_name("multi_fit.py"))
+        elif args.candidate_cache:
+            raise ValueError("--candidate-cache requires an instance visit assignment")
+        ctx=motion_context(args.geometry,args.vertices_path,args.contacts,args.frame_indices,output,
+                           visits=visits,locations=assignment.get("locations") if assignment else None)
         report["support_selection"]={key:value for key,value in ctx["phase"].items()
                                      if key not in ("selection_reasons","thresholds","selection_proxy")}
-        if not len(ctx["support_frames"]):
-            report["rejection_reasons"]=["no_support_evidence"]
+        missing=[visit for visit in ctx["phase"].get("visits",[]) if not visit["selected_source_frames"]]
+        if not len(ctx["support_frames"]) or missing:
+            report["rejection_reasons"]=["visit_support_unverified" if missing else "no_support_evidence"]
             write_json(output/"fit_result.json",report)
             return 2
         regions=body_regions(ctx)
@@ -853,10 +895,36 @@ def main(argv=None):
         else:
             raise ValueError("Provide --assets-manifest or --models-dir for CAD candidates")
         contacts=contact_roles(ctx,regions,output)
+        asset_ids=set()
+        if args.candidate_cache:
+            manifest=json.loads(args.geometry.read_text(encoding="utf-8"))
+            fd=manifest.get("fitting_data",manifest)
+            inputs={key:sha256(resolve(args.geometry.parent,fd[key])) for key in ("world","joints","joint_names","faces")}
+            inputs.update(manifest=sha256(args.geometry),low=report["world_sha256"],contacts=report["prediction_sha256"],
+                          frame_map=sha256(args.frame_indices),instance=assignment["instance_id"])
+            runtime={name:importlib.metadata.version(name) for name in ("numpy","scipy","open3d","trimesh")}
+            cache=CandidateCache(args.candidate_cache,inputs,[platform.platform(),platform.python_version(),
+                runtime,report["implementation_sha256"]],assignment,ctx["phase"])
+            report["cache_hits"]=[]
         for path in assets:
             print("Fitting",str(path),flush=True)
+            checkpoint=None
+            record=None
+            if assignment is not None:
+                asset=json.loads(Path(path).read_text(encoding="utf-8"))
+                asset_id=valid_name(asset.get("id",asset.get("asset_id",Path(path).parent.name)))
+                if asset_id in asset_ids:
+                    raise ValueError("Duplicate asset id: "+asset_id)
+                asset_ids.add(asset_id)
+            if cache:
+                record,checkpoint,_=cache.lookup(Path(path),output)
+                if record is not None:
+                    report["cache_hits"].append(record["id"])
             try:
-                record=fit_asset(path,ctx,anchors,estimate,output,contacts)
+                if record is None:
+                    record=fit_asset(path,ctx,anchors,estimate,output,contacts)
+                    if cache and checkpoint is not None:
+                        cache.publish(checkpoint,output/"candidates"/record["id"])
             except (ValueError,FileNotFoundError,KeyError) as exc:
                 record=dict(id=Path(path).parent.name,qualified=False,retained=False,loss=None,metrics={},
                     rejection_reasons=[("support_geometry_unverified: " if isinstance(exc, UnverifiedSupport)

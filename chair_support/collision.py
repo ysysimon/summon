@@ -10,6 +10,7 @@ import numpy as np
 import open3d as o3d
 import trimesh
 from .geometry_audit import NUMERIC_MARGIN, PART_NAMES, children as _children, prepare_geometry, ray_scene
+from .runtime import count
 
 MAXIMUM_PENETRATION = .005
 MIN_CELL_RADIUS = .000015625
@@ -115,7 +116,8 @@ class ClosedSolid:
     An outside witness supplies the upper distance bound; if the closest witness
     is hidden inside another component, the enclosing-box witness stays safe.
     """
-    def __init__(self, vertices, faces, topology, kind, prepared=False):
+    def __init__(self, vertices, faces, topology, kind, prepared=False, limit=MAXIMUM_PENETRATION):
+        self.limit = limit
         self.components = []
         self.kind = kind
         self.vertices = np.asarray(vertices)
@@ -150,6 +152,8 @@ class ClosedSolid:
         non-integer winding and points within the boundary margin stay uncertain.
         """
         n = len(points)
+        count("collision.occupancy.calls")
+        count("collision.occupancy.points", n)
         origins = np.repeat(points, 3, axis=0)
         rays = np.column_stack((origins, np.tile(RAY_DIRECTIONS, (n, 1))))
         hits = component["scene"].list_intersections(o3d.core.Tensor(rays.astype(np.float32)))
@@ -174,6 +178,7 @@ class ClosedSolid:
                 if not np.isfinite(boundary_distance) or boundary_distance <= NUMERIC_MARGIN:
                     continue
                 component["winding_fallback_queries"] += 1
+                count("collision.winding_fallback_queries")
                 value = solid_angle_winding(component["triangles"], points[index])
                 if not np.isfinite(value):
                     continue
@@ -182,6 +187,7 @@ class ClosedSolid:
                     inside[index] = integer != 0
                     uncertain[index] = False
                     component["winding_fallback_resolved"] += 1
+                    count("collision.winding_fallback_resolved")
         return inside, uncertain
 
     def overlaps(self, triangles):
@@ -221,7 +227,17 @@ class ClosedSolid:
                 o3d.core.Tensor(points.astype(np.float32))).numpy().astype(float)
             if not np.isfinite(d).all():
                 raise InvalidSolid(dict(kind=self.kind, reason="non_finite_signed_distance"))
-            occupied, uncertain = self.occupancy(component, points)
+            # A validated closed component cannot contain points outside its
+            # AABB. Keep the numerical boundary band on the original classifier
+            # and retain unsigned distances for all points and nearest labels.
+            lo, hi = component["bounds"]
+            selected = np.flatnonzero(np.all(points >= lo-NUMERIC_MARGIN, axis=1)
+                                      & np.all(points <= hi+NUMERIC_MARGIN, axis=1))
+            occupied = np.zeros(n, bool)
+            uncertain = np.zeros(n, bool)
+            count("collision.occupancy.aabb_excluded_points", n-len(selected))
+            if len(selected):
+                occupied[selected], uncertain[selected] = self.occupancy(component, points[selected])
             observations.append((d, occupied, uncertain))
             closer = d < min_outside
             part[closer] = number
@@ -241,7 +257,7 @@ class ClosedSolid:
         upper = np.maximum(0., exit_distance) + 2*NUMERIC_MARGIN
         # Deep samples already reject; expensive witnesses only help certify
         # samples close enough to the 5 mm boundary to possibly pass.
-        eligible = possible_inside & (depth_lower <= MAXIMUM_PENETRATION)
+        eligible = possible_inside & (depth_lower <= self.limit)
         for number, (component, observation) in enumerate(zip(self.components, observations)):
             d, occupied, uncertain = observation
             ids = np.flatnonzero(eligible & (occupied | uncertain))
@@ -269,7 +285,7 @@ class ClosedSolid:
         return phi_lower, phi_upper, part
 
 
-def surface_bounds(vertices, faces, target, source_labels=None, budget=QUERY_BUDGET):
+def surface_bounds(vertices, faces, target, source_labels=None, budget=QUERY_BUDGET, limit=MAXIMUM_PENETRATION):
     """Bound the entire source surface, including wholly interior triangles."""
     fallback_before = [sum(c[key] for c in target.components) for key in
                        ("winding_fallback_queries", "winding_fallback_resolved")]
@@ -301,6 +317,8 @@ def surface_bounds(vertices, faces, target, source_labels=None, budget=QUERY_BUD
         centers = triangles.mean(1)
         radius = np.linalg.norm(triangles-centers[:, None], axis=-1).max(1)
         signed_lo, signed_hi, target_parts = target.signed_bounds(centers)
+        count("collision.subdivision.levels")
+        count("collision.surface.sample_points", len(centers))
         queries += len(centers)
         point_lower = np.maximum(0., -signed_hi)
         cell_upper = np.maximum(0., -signed_lo + radius)
@@ -314,13 +332,13 @@ def surface_bounds(vertices, faces, target, source_labels=None, budget=QUERY_BUD
                          target_component=int(component["id"]), target_parts=component["parts"],
                          sample_lower_bound=float(point_lower[index]),
                          sample_upper_bound=float(max(0., -signed_lo[index])))
-        accepted = cell_upper <= MAXIMUM_PENETRATION
-        failed = point_lower > MAXIMUM_PENETRATION
+        accepted = cell_upper <= limit
+        failed = point_lower > limit
         too_small = radius <= MIN_CELL_RADIUS
         final = accepted | failed | too_small
         # One measured counterexample suffices to reject. Stop refining this
         # surface, retaining valid (possibly loose) bounds for every queued cell.
-        proven_failure = lower_max > MAXIMUM_PENETRATION
+        proven_failure = lower_max > limit
         if proven_failure:
             final[:] = True
         unresolved_here = too_small & ~accepted & ~failed & (not proven_failure)
@@ -356,25 +374,25 @@ def surface_bounds(vertices, faces, target, source_labels=None, budget=QUERY_BUD
                 penetrating_area_estimate=area_estimate)
 
 
-def collision_checks(collision):
-    if collision["maximum_penetration"] > MAXIMUM_PENETRATION:
+def collision_checks(collision, limit=MAXIMUM_PENETRATION):
+    if collision["maximum_penetration"] > limit:
         return ["full_motion_penetration"]
     upper = collision.get("maximum_penetration_upper_bound")
     complete = collision.get("checked_source_frames", 0) == collision.get("required_source_frames", -1)
-    if collision.get("uncertain_frames") or not complete or upper is None or upper > MAXIMUM_PENETRATION:
+    if collision.get("uncertain_frames") or not complete or upper is None or upper > limit:
         return ["collision_depth_undetermined"]
     return []
 
 
-def furniture_bounds(body, faces, exact, outer):
+def furniture_bounds(body, faces, exact, outer, limit=MAXIMUM_PENETRATION):
     """Bound depth into the unknown solid between its verified inner and outer unions."""
-    inner = surface_bounds(body, faces, exact)
+    inner = surface_bounds(body, faces, exact, limit=limit)
     if exact is outer:
         return inner
-    envelope = surface_bounds(body, faces, outer)
+    envelope = surface_bounds(body, faces, outer, limit=limit)
     high = envelope["upper_bound"]
-    uncertain = high is None or high > MAXIMUM_PENETRATION
-    inner.update(upper_bound=high, uncertain=uncertain and inner["lower_bound"] <= MAXIMUM_PENETRATION,
+    uncertain = high is None or high > limit
+    inner.update(upper_bound=high, uncertain=uncertain and inner["lower_bound"] <= limit,
                  penetrating_area_upper_bound=envelope["penetrating_area_upper_bound"],
                  envelope_query_count=envelope["query_count"])
     if inner["uncertain"]:
@@ -387,10 +405,10 @@ def furniture_bounds(body, faces, exact, outer):
     return inner
 
 
-def collision_check(ctx, mesh, parts=None, prepared=None, pose=None):
+def collision_check(ctx, mesh, parts=None, prepared=None, pose=None, limit=MAXIMUM_PENETRATION):
     """Original surfaces prove lower bounds. Certified outer geometry bounds possible depth."""
     total = len(ctx["dense"])
-    report = dict(maximum_penetration=0., maximum_penetration_lower_bound=0.,
+    report = dict(penetration_limit_m=limit, maximum_penetration=0., maximum_penetration_lower_bound=0.,
                   maximum_penetration_upper_bound=0., worst_collision_frame=None,
                   edge_triangle_crossings=0, checked_source_frames=0,
                   geometry_checked_source_frames=0, required_source_frames=total,
@@ -416,7 +434,7 @@ def collision_check(ctx, mesh, parts=None, prepared=None, pose=None):
             prepared = prepare_geometry(mesh, parts)
         rotation, translation, scale = (np.eye(3), np.zeros(3), 1.) if pose is None else pose
         pieces = prepared.posed(rotation, translation, scale)
-        chair = ClosedSolid(mesh.vertices, mesh.faces, pieces, "furniture", prepared=True)
+        chair = ClosedSolid(mesh.vertices, mesh.faces, pieces, "furniture", prepared=True, limit=limit)
         geometry = prepared.summary()
         report["geometry"] = geometry
         unknown = [r["id"] for r in prepared.records if r["mode"] == "unknown"]
@@ -445,14 +463,14 @@ def collision_check(ctx, mesh, parts=None, prepared=None, pose=None):
             body = np.asarray(ctx["dense"][frame])
             capped = np.vstack([body]+[body[loop].mean(0)[None] for loop in loops])
             report["geometry_checked_source_frames"] = frame+1
-            target = ClosedSolid(capped, faces, body_topology, "body")
-            chair_to_body = surface_bounds(mesh.vertices, mesh.faces, target, labels)
+            target = ClosedSolid(capped, faces, body_topology, "body", limit=limit)
+            chair_to_body = surface_bounds(mesh.vertices, mesh.faces, target, labels, limit=limit)
             # Original visible body surface is the source; caps define only the
             # target solid. Caps are never reported as physical human surface.
             # A bound-only part may also occlude an exit witness for another
             # solid. Exclude it only outside the body's full 5 mm neighbourhood.
             body_min, body_max = capped.min(0), capped.max(0)
-            padding = MAXIMUM_PENETRATION + 2*NUMERIC_MARGIN
+            padding = limit + 2*NUMERIC_MARGIN
             nearby, active_hulls = [], []
             triangle_bounds = None
             for i, (lo, hi) in {**boxes, **hull_boxes}.items():
@@ -476,12 +494,12 @@ def collision_check(ctx, mesh, parts=None, prepared=None, pose=None):
             if active_hulls:
                 outer = copy(chair)
                 outer.components = [c for c in chair.components if c["mode"] != "hull" or c["id"] in active_hulls]
-            body_to_chair = furniture_bounds(body, ctx["faces"], exact, outer)
+            body_to_chair = furniture_bounds(body, ctx["faces"], exact, outer, limit=limit)
             # A distant envelope cannot affect an exit within 5 mm. A looser
             # bound must include every envelope, even one outside that radius.
             if boxes or hull_boxes:
                 high = body_to_chair["upper_bound"]
-                if high is not None and high > MAXIMUM_PENETRATION and (boxes or len(active_hulls) < len(hull_boxes)):
+                if high is not None and high > limit and (boxes or len(active_hulls) < len(hull_boxes)):
                     body_to_chair["upper_bound"] = None
             if unknown or nearby:
                 body_to_chair["uncertain"] = True
@@ -537,7 +555,7 @@ def collision_check(ctx, mesh, parts=None, prepared=None, pose=None):
                 penetrating_surface_area_estimate=area, directions=directions,
                 uncertain=uncertain))
             report["checked_source_frames"] = frame+1
-            if (lower > MAXIMUM_PENETRATION or (uncertain and not partial)) and not ctx.get("collision_scan_rejected_frames", False):
+            if (lower > limit or (uncertain and not partial)) and not ctx.get("collision_scan_rejected_frames", False):
                 break
     except (InvalidSolid, ValueError) as exc:
         issue = exc.issue if isinstance(exc, InvalidSolid) else dict(reason=str(exc))
@@ -553,7 +571,7 @@ def collision_check(ctx, mesh, parts=None, prepared=None, pose=None):
     if report["checked_source_frames"] < total:
         # A bound on inspected frames is never a bound on the full motion.
         report["maximum_penetration_upper_bound"] = None
-    report["status"] = ("rejected" if report["maximum_penetration"] > MAXIMUM_PENETRATION
+    report["status"] = ("rejected" if report["maximum_penetration"] > limit
                         else "undetermined" if collision_checks(report) else "certified_below_limit")
     report["worst_collision_frame_scope"] = ("all source frames" if report["checked_source_frames"] == total
                                              else "checked source frames only")

@@ -52,7 +52,8 @@ class InstanceFittingTests(unittest.TestCase):
         valid = dict(coverage=1.0, gap_p20=0.003, maximum_seat_intrusion=0.001)
         measurements = {key: [dict(valid, frame=0), dict(valid, frame=2)] for key in REGIONS}
         measurements["left_gluteus"][1]["gap_p20"] = 0.016
-        states = evaluate_visits(visits, measurements)
+        from chair_support.policy import FitPolicy
+        states = evaluate_visits(visits, measurements, FitPolicy(support_validation=True, penetration_validation=True))
         self.assertTrue(states[0]["verified"])
         self.assertEqual(states[1]["rejection_reasons"], ["left_gluteus:insufficient_support"])
 

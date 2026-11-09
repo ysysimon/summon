@@ -8,6 +8,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import QhullError
 import trimesh
+from .query_backend import cpu_scene
 
 
 NUMERIC_MARGIN = 1e-5
@@ -17,10 +18,8 @@ PART_NAMES = {0: "seat", 1: "backrest", 2: "base"}
 
 
 def ray_scene(vertices, faces):
-    scene = o3d.t.geometry.RaycastingScene(nthreads=1)
-    scene.add_triangles(o3d.core.Tensor(np.asarray(vertices, np.float32)),
-                        o3d.core.Tensor(np.asarray(faces, np.uint32)))
-    return scene
+    # Certification must remain on CPU even when optimization selects Warp.
+    return cpu_scene(vertices, faces)
 
 
 def children(triangles):

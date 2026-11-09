@@ -8,6 +8,7 @@ from itertools import combinations, product
 import json
 import math
 import os
+import platform
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -19,7 +20,9 @@ import trimesh
 
 from .collision import ClosedSolid, MAXIMUM_PENETRATION, collision_check
 from .engine import REGIONS, read_asset, sha256
+from .policy import FitPolicy, eligible, skipped
 from .geometry_audit import GeometryAudit, NUMERIC_MARGIN, children, prepare_geometry
+from .runtime import current_options
 
 
 def read(path):
@@ -61,7 +64,7 @@ def array_key(values):
 
 def scene_inputs(ctx, input_key):
     return dict(
-        source=input_key,
+        source=input_key, policy=ctx.get("policy", FitPolicy()).record(),
         dense=array_key(ctx["dense"]),
         faces=array_key(ctx["faces"]),
         frame_count=len(ctx["dense"]),
@@ -69,7 +72,13 @@ def scene_inputs(ctx, input_key):
 
 
 def source_files(record, directory):
-    source = (directory / record["source_asset"]).resolve(strict=True)
+    # Windows extended paths do not normalize '..' in filesystem calls.
+    joined = str(directory / record["source_asset"])
+    if os.name == "nt" and joined.startswith("\\\\?\\"):
+        joined = joined[:4] + os.path.normpath(joined[4:])
+    else:
+        joined = os.path.normpath(joined)
+    source = Path(joined).resolve(strict=True)
     meta = read(source)
     return [
         source,
@@ -83,12 +92,14 @@ def binding(fit_dir, inputs, instance_id):
     result = read(path)
     records = {}
     for c in result["candidates"]:
-        if not c.get("qualified"):
+        if not eligible(c):
             continue
         if c["id"] in records or not math.isfinite(c["loss"]):
             raise ValueError("Invalid or duplicate qualified candidate")
         mesh = fit_dir / c["mesh"]
-        files = [mesh, fit_dir / c["parts"], mesh.with_name("collision.json"), *source_files(c, fit_dir)]
+        files = [mesh, fit_dir / c["parts"], *source_files(c, fit_dir)]
+        if FitPolicy.from_record(result.get("policy")).penetration_validation:
+            files.append(mesh.with_name("collision.json"))
         records[c["id"]] = [sha256(p) for p in files]
     return dict(
         version=1, instance_id=instance_id, inputs=inputs, fit_result_sha256=sha256(path), candidates=records
@@ -126,7 +137,7 @@ class Candidate:
         return self.instance, self.record["id"]
 
 
-def validated_frames(path, frame_count):
+def validated_frames(path, frame_count, limit=MAXIMUM_PENETRATION):
     certificate = read(path)
     rows = certificate["frames"]
     if (
@@ -146,18 +157,18 @@ def validated_frames(path, frame_count):
             if (
                 value["uncertain"]
                 or value["upper_bound"] is None
-                or not 0 <= value["lower_bound"] <= value["upper_bound"] <= MAXIMUM_PENETRATION
+                or not 0 <= value["lower_bound"] <= value["upper_bound"] <= limit
             ):
                 raise ValueError("Invalid directional full-motion certificate")
             bounds.append(value["upper_bound"])
-        if not max(bounds) <= row["penetration_upper_bound"] <= MAXIMUM_PENETRATION:
+        if not max(bounds) <= row["penetration_upper_bound"] <= limit:
             raise ValueError("Invalid per-frame penetration upper bound")
     return rows
 
 
-def load_candidate(instance, record, fit_dir, frame_count):
+def load_candidate(instance, record, fit_dir, frame_count, limit=MAXIMUM_PENETRATION):
     mesh_file = inside(fit_dir, record["mesh"])
-    frames = validated_frames(mesh_file.with_name("collision.json"), frame_count)
+    frames = validated_frames(mesh_file.with_name("collision.json"), frame_count, limit)
     src, src_mesh, _ = source_files(record, fit_dir)
     meta, local, parts = read_asset(src)
     if sha256(src_mesh) != record["source_geometry_sha256"]:
@@ -399,7 +410,7 @@ def union_collision(ctx, candidates):
         vertex_offset += len(candidate.mesh.vertices)
     raw = trimesh.Trimesh(np.concatenate(vertices), np.concatenate(faces), process=False)
     audit = GeometryAudit(records=records, solids=solids, face_components=np.concatenate(face_map))
-    check = collision_check(ctx, raw, {"face_part_ids": np.concatenate(labels)}, prepared=audit)
+    check = collision_check(ctx, raw, {"face_part_ids": np.concatenate(labels)}, prepared=audit, limit=ctx.get("policy", FitPolicy()).max_penetration_m)
     if check.get("penetration_witness"):
         w = check["penetration_witness"]
         seat, local_component, offset = owners[w["furniture_component"]]
@@ -515,14 +526,16 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
     count = len(ctx["dense"])
     if count < 1:
         raise ValueError("Empty human motion")
+    policy = ctx.get("policy", FitPolicy())
     inputs = scene_inputs(ctx, input_key)
     ordered, seals, dirs = [], {}, {}
     report = dict(
-        status="no_valid_scene",
+        status="no_valid_scene", policy=policy.record(),
+        strict_query_backend="open3d", execution=current_options().record(),
         selected=[],
         attempts=[],
         source_frames=count,
-        collision=None,
+        collision=skipped() if not policy.penetration_validation else None,
         combination_budget=max_combinations,
         rejection_reasons=[],
     )
@@ -539,7 +552,7 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
         dirs[instance], seals[instance] = root, seal["candidates"]
         fit = read(root / "fit_result.json")
         candidates = fit["candidates"]
-        pool = sorted((c for c in candidates if c.get("qualified")), key=lambda c: (c["loss"], c["id"]))
+        pool = sorted((c for c in candidates if eligible(c)), key=lambda c: (c["loss"], c["id"]))
         if not pool:
             failures = {c["id"]: c.get("rejection_reasons", []) for c in candidates}
             states = {
@@ -564,10 +577,13 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
         return report
     impl = {
         name: sha256(Path(__file__).parent / name)
-        for name in ("multi_scene.py", "collision.py", "geometry_audit.py", "engine.py")
+        for name in ("multi_scene.py", "collision.py", "geometry_audit.py", "engine.py", "policy.py",
+                     "query_backend.py", "runtime.py")
     }
     impl.update(
-        numpy=np.__version__, scipy=scipy.__version__, trimesh=trimesh.__version__, open3d=o3d.__version__
+        numpy=np.__version__, scipy=scipy.__version__, trimesh=trimesh.__version__, open3d=o3d.__version__,
+        platform=platform.platform(), python=platform.python_version(),
+        strict_query_backend=report["strict_query_backend"], execution=report["execution"],
     )
     loaded, pairs = {}, {}
     keys = sorted(dirs)
@@ -598,36 +614,39 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
             outcome = cached_outcome(shared, cache_key)
         attempt["checkpoint_reused"] = outcome is not None
         if outcome is None:
-            choice = []
-            for instance, rows, i in zip(keys, ordered, indices):
-                k = (instance, rows[i]["id"])
-                if k not in loaded:
-                    loaded[k] = load_candidate(instance, rows[i], dirs[instance], count)
-                choice.append(loaded[k])
-            furniture = []
-            for a, b in combinations(choice, 2):
-                pair_key = (a.key, b.key)
-                if pair_key not in pairs:
-                    pairs[pair_key] = static_pair(a, b)
-                furniture.append(pairs[pair_key])
-            statuses = {p["status"] for p in furniture}
-            collision = None
-            if "overlap" in statuses:
-                state = "furniture_overlap"
+            if not policy.penetration_validation:
+                outcome = dict(status="diagnostic_complete",furniture_pairs=[],collision=skipped())
             else:
-                collision = (
-                    reused_certificate(choice, count)
-                    if statuses <= {"separated"}
-                    else union_collision(ctx, choice)
-                )
-                state = {
-                    "certified_below_limit": "success",
-                    "rejected": "measured_penetration",
-                    "undetermined": "collision_depth_undetermined",
-                }[collision["status"]]
-                if "undetermined" in statuses and state != "measured_penetration":
-                    state = "furniture_geometry_undetermined"
-            outcome = dict(status=state, furniture_pairs=furniture, collision=collision)
+                choice = []
+                for instance, rows, i in zip(keys, ordered, indices):
+                    k = (instance, rows[i]["id"])
+                    if k not in loaded:
+                        loaded[k] = load_candidate(instance, rows[i], dirs[instance], count, policy.max_penetration_m)
+                    choice.append(loaded[k])
+                furniture = []
+                for a, b in combinations(choice, 2):
+                    pair_key = (a.key, b.key)
+                    if pair_key not in pairs:
+                        pairs[pair_key] = static_pair(a, b)
+                    furniture.append(pairs[pair_key])
+                statuses = {p["status"] for p in furniture}
+                collision = None
+                if "overlap" in statuses:
+                    state = "furniture_overlap"
+                else:
+                    collision = (
+                        reused_certificate(choice, count)
+                        if statuses <= {"separated"}
+                        else union_collision(ctx, choice)
+                    )
+                    state = {
+                        "certified_below_limit": "success",
+                        "rejected": "measured_penetration",
+                        "undetermined": "collision_depth_undetermined",
+                    }[collision["status"]]
+                    if "undetermined" in statuses and state != "measured_penetration":
+                        state = "furniture_geometry_undetermined"
+                outcome = dict(status=state, furniture_pairs=furniture, collision=collision)
             if shared != cache:
                 write_atomic(shared, dict(key=cache_key, sha256=content_key(outcome), outcome=outcome))
         # Every run includes its evidence with no dependency on the shared cache.
@@ -636,7 +655,7 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
         if outcome["collision"] and outcome["collision"].get("penetration_witness"):
             attempt["penetration_witness"] = outcome["collision"]["penetration_witness"]
         report["attempts"].append(attempt)
-        if outcome["status"] == "success":
+        if outcome["status"] in ("success", "diagnostic_complete"):
             selected = []
             for k, c in zip(keys, chosen):
                 selected.append(
@@ -649,7 +668,7 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
                         parts=Path(os.path.relpath(inside(dirs[k], c["parts"]), output)).as_posix(),
                     )
                 )
-            report.update(status="success", selected=selected, collision=outcome["collision"])
+            report.update(status="success" if policy.strict else "diagnostic_complete", selected=selected, collision=outcome["collision"])
             break
     if report["status"] == "no_valid_scene":
         reasons = sorted({a["status"] for a in report["attempts"]})

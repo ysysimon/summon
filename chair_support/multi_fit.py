@@ -82,7 +82,11 @@ def retain_return_visits(visits, selected, valid, support_ids, anchors, weights,
     return np.asarray(sorted(chosen), int), evidence
 
 
-def evaluate_visits(visits, measurements):
+def evaluate_visits(visits, measurements, policy=None):
+    from .policy import FitPolicy
+    policy = policy or FitPolicy()
+    if not (policy.support_validation or policy.penetration_validation):
+        return [dict(start=v["start"],end=v["end"],status="skipped_disabled",checked_source_frames=0,verified=False,rejection_reasons=[]) for v in visits]
     from .engine import support_checks
 
     by_region = {region: {row["frame"]: row for row in rows} for region, rows in measurements.items()}
@@ -94,7 +98,7 @@ def evaluate_visits(visits, measurements):
             if any(frame not in rows for rows in by_region.values()):
                 reasons.add("missing_source_frames")
                 continue
-            reasons.update(support_checks({region: rows[frame] for region, rows in by_region.items()}))
+            reasons.update(support_checks({region: rows[frame] for region, rows in by_region.items()}, policy))
         result.append(dict(start=visit["start"], end=visit["end"], checked_source_frames=len(frames),
                            verified=not reasons, rejection_reasons=sorted(reasons)))
     return result

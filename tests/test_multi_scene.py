@@ -13,6 +13,8 @@ import trimesh
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from chair_support.collision import collision_check, collision_checks
 from chair_support import multi_scene as scene
+from chair_support.runtime import ExecutionOptions, execution_scope
+from chair_support.policy import FitPolicy
 
 
 def box(center, size):
@@ -23,7 +25,8 @@ def box(center, size):
 
 def person(positions=((0, 0, 0.35),), size=(0.03, 0.03, 0.05)):
     body = box([0, 0, 0], size)
-    return dict(dense=np.asarray([body.vertices + np.array(p) for p in positions]), faces=body.faces)
+    return dict(dense=np.asarray([body.vertices + np.array(p) for p in positions]), faces=body.faces,
+                policy=FitPolicy(support_validation=True, penetration_validation=True))
 
 
 def set_up_candidate(ctx, root, name, center, loss=1.0, size=(0.1, 0.1, 0.1), angle=0.0):
@@ -229,6 +232,26 @@ class MultiSceneTests(unittest.TestCase):
         self.assertTrue((moved / second["attempts"][0]["checkpoint"]).is_file())
         self.assertEqual((moved / second["selected"][0]["mesh"]).resolve(), (fit / pool[0]["mesh"]).resolve())
         self.assertEqual(first["collision"], second["collision"])
+
+    def test_scene_cache_binds_query_implementation_and_execution(self):
+        self.add("A", [("a", (0.0, 0.0, 0.0))])
+        first = self.assemble()
+        self.assertEqual(first["strict_query_backend"], "open3d")
+        self.assertTrue(self.assemble()["attempts"][0]["checkpoint_reused"])
+        original_hash = scene.sha256
+        for name in ("query_backend.py", "runtime.py"):
+            with self.subTest(module=name):
+                def changed_hash(path):
+                    return "changed-" + original_hash(path) if Path(path).name == name else original_hash(path)
+                with patch.object(scene, "sha256", side_effect=changed_hash):
+                    changed = self.assemble()
+                self.assertFalse(changed["attempts"][0]["checkpoint_reused"])
+                self.assertNotEqual(changed["attempts"][0]["checkpoint"], first["attempts"][0]["checkpoint"])
+        with execution_scope(ExecutionOptions(query_threads=1)):
+            changed = self.assemble()
+        self.assertFalse(changed["attempts"][0]["checkpoint_reused"])
+        self.assertEqual(changed["execution"]["actual_query_threads"], 1)
+        self.assertEqual(changed["collision"], first["collision"])
 
     def test_overlapping_proxy_is_uncertain_not_measured_furniture_intersection(self):
         outer = box([0, 0, 0], [0.5, 0.5, 0.5])

@@ -12,6 +12,9 @@ from chair_support.engine import (REGIONS, support_checks, region_metrics, ray_s
     support_query, edge_intersections, close_body_topology, contiguous_runs)
 from chair_support.engine import placement_checks,collision_check,collision_checks,read_asset,rotation
 from chair_support.engine import fit_asset,estimate_back_slant
+from chair_support.policy import FitPolicy
+
+STRICT_POLICY = FitPolicy(support_validation=True, penetration_validation=True)
 
 
 class SupportTests(unittest.TestCase):
@@ -32,13 +35,13 @@ class SupportTests(unittest.TestCase):
         # A convex underside touches near its low point, naturally receding.
         gaps=np.array([0.,.002,.006,.020,.040,.060])
         metrics={r:region_metrics(gaps,np.ones(len(gaps),bool)) for r in REGIONS}
-        self.assertEqual(support_checks(metrics),[])
+        self.assertEqual(support_checks(metrics, STRICT_POLICY),[])
 
     def test_floating_and_narrow_seats_fail(self):
         floating={r:region_metrics(np.full(10,.08),np.ones(10,bool)) for r in REGIONS}
-        self.assertTrue(any("insufficient_support" in s for s in support_checks(floating)))
+        self.assertTrue(any("insufficient_support" in s for s in support_checks(floating, STRICT_POLICY)))
         narrow={r:region_metrics(np.zeros(10),np.arange(10)<5) for r in REGIONS}
-        self.assertTrue(any("coverage" in s for s in support_checks(narrow)))
+        self.assertTrue(any("coverage" in s for s in support_checks(narrow, STRICT_POLICY)))
 
     def test_coverage_uses_projected_area_not_surface_slope(self):
         # Equal XY cells cover equal footprints even when one surface is steep.
@@ -105,7 +108,7 @@ class SupportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"chair surface"):
                 read_asset(root/"asset.json")
 
-    def fit_control(self,mesh_scale=1.,source="infinigen-test", offsets=None, selected=None, weights=None):
+    def fit_control(self,mesh_scale=1.,source="infinigen-test", offsets=None, selected=None, weights=None, policy=STRICT_POLICY):
         def box(extents,center):
             result=trimesh.creation.box(extents=extents)
             result.apply_translation(center)
@@ -123,6 +126,8 @@ class SupportTests(unittest.TestCase):
         ctx=dict(dense=np.repeat(body.vertices[None],3,axis=0),faces=body.faces,support_frames=stable,
             frame_weights=np.ones(3) if weights is None else np.asarray(weights),
             fps=30.,pelvis=np.tile([0.,0.,.62],(3,1)),forward=np.tile([0.,1.,0.],(3,1)),floor=0.)
+        if policy is not None:
+            ctx["policy"] = policy
         if offsets is not None:
             ctx["dense"][:,:,2]+=np.asarray(offsets)[:,None]
         anchors={}

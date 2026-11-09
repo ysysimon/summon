@@ -112,7 +112,7 @@ class CollisionContractTests(unittest.TestCase):
         self.assertTrue(result["uncertainty_reasons"])
         self.assertIsNone(result["maximum_penetration_upper_bound"])
 
-    def test_real_mirror_frame30_far_point_uses_float64_fallback(self):
+    def test_real_mirror_frame30_far_point_is_outside_with_original_classifier_fallback(self):
         # Optional integration fixture: retain original dense geometry locally,
         # without redistributing licensed body assets in the test source tree.
         geometry = Path(__file__).resolve().parents[3]/"artifacts/summon/runs/supported-chair-A053-M-v6/geometry"
@@ -126,10 +126,14 @@ class CollisionContractTests(unittest.TestCase):
         # Observed old all-hit rays [0,0,1], although this chair-base point is
         # 459.7 mm outside the body. Full winding is approximately 2e-18.
         point = np.array([[-.11311867333333332,.14678597333333335,.008477953333333335]])
+        # Preserve direct coverage of the historical ray disagreement even if
+        # the optimized signed-bound path can now prove exclusion using AABB.
+        occupied, uncertain = solid.occupancy(solid.components[0], point)
+        self.assertFalse(occupied[0]); self.assertFalse(uncertain[0])
+        self.assertGreater(sum(c["winding_fallback_resolved"] for c in solid.components),0)
         low, high, _ = solid.signed_bounds(point)
         self.assertGreater(low[0], .459)
         self.assertGreaterEqual(high[0], low[0])
-        self.assertGreater(sum(c["winding_fallback_resolved"] for c in solid.components),0)
 
     def test_complete_body_containment_is_not_zero_penetration(self):
         body = trimesh.creation.box(extents=[.02, .02, .02])

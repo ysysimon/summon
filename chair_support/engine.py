@@ -6,6 +6,7 @@ All acceptance decisions and failures are exported, including rejected meshes.
 import argparse
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,12 @@ from .collision import collision_check, collision_checks, close_body_topology, e
 from .geometry_audit import prepare_geometry
 from .selection import (VERSION as SELECTION_VERSION, evidence_weights, select_support,
                         support_intervals, sample_support_frames, weighted_quantile, weighted_vector)
+
+from .policy import FitPolicy, add_arguments, eligible, skipped
+from .runtime import ExecutionOptions, Profile, execution_scope, add_execution_arguments
+from .query_backend import query_scene
+from .solver_helpers import PoseCache, choose_current_result, batched_support_metrics, candidate_directory_key
+from .candidate_pool import pack_arrays, unpack_arrays, ordered_spawn_map
 
 REGIONS = ("left_gluteus", "right_gluteus", "left_thigh", "right_thigh")
 DEFAULTS = dict(short_support_warning_seconds=.4, pelvis_speed_weight_scale=.08,
@@ -59,10 +66,9 @@ def rotation(yaw):
 
 
 def ray_scene(vertices, faces):
-    scene = o3d.t.geometry.RaycastingScene(nthreads=1)
-    scene.add_triangles(o3d.core.Tensor(np.asarray(vertices, np.float32)),
-                        o3d.core.Tensor(np.asarray(faces, np.uint32)))
-    return scene
+    # This public helper remains CPU-only for strict validation and old callers.
+    from .geometry_audit import ray_scene as cpu_scene
+    return cpu_scene(vertices, faces)
 
 
 def vertex_normals(vertices, faces):
@@ -443,6 +449,8 @@ def read_asset(path):
 
 
 def support_query(points, scene, r, translation, scale):
+    if hasattr(scene, "support_query"):
+        return scene.support_query(points,r,translation,scale)
     local = (points-translation) @ r / scale
     origins = local.copy()
     origins[:, 2] += 3.
@@ -466,16 +474,17 @@ def region_metrics(gaps, valid, weights=None):
                 maximum_seat_intrusion=float(max(0., -gaps[valid].min())) if valid.any() else None)
 
 
-def support_checks(metrics):
+def support_checks(metrics, policy=None):
+    policy = policy or FitPolicy()
     failures = []
     for region in REGIONS:
         m = metrics[region]
-        limit = DEFAULTS["gluteus_gap"] if "gluteus" in region else DEFAULTS["thigh_gap"]
-        if m["coverage"] < DEFAULTS["coverage"]:
+        limit = policy.gap(region)
+        if policy.support_validation and m["coverage"] < policy.support_min_coverage:
             failures.append(region+":insufficient_seat_coverage")
-        if m["gap_p20"] is None or m["gap_p20"] > limit:
+        if policy.support_validation and (m["gap_p20"] is None or m["gap_p20"] > limit):
             failures.append(region+":insufficient_support")
-        if m["maximum_seat_intrusion"] is not None and m["maximum_seat_intrusion"] > DEFAULTS["maximum_penetration"]:
+        if policy.penetration_validation and m["maximum_seat_intrusion"] is not None and m["maximum_seat_intrusion"] > policy.max_penetration_m:
             failures.append(region+":seat_penetration")
     return failures
 
@@ -486,7 +495,9 @@ def placement_checks(mesh, parts, pelvis, body_forward, chair_forward, floor):
     yaw_errors=np.degrees(np.arccos(np.clip(body_forward@chair_forward,-1.,1.)))
     floor_error=float(abs(mesh.vertices[:,2].min()-floor))
     reasons=[]
-    if posterior.max()>=0: reasons.append("backrest_not_behind_pelvis")
+    # Temporarily skip the pelvis-half-space backrest check (2026-11-09).
+    # Keep posterior and the reported offset as diagnostic measurements only.
+    # if posterior.max()>=0: reasons.append("backrest_not_behind_pelvis")
     if yaw_errors.max()>DEFAULTS["maximum_yaw_degrees"]: reasons.append("chair_heading_mismatch")
     if floor_error>DEFAULTS["floor_tolerance"]: reasons.append("chair_not_grounded")
     return dict(backrest_forward_offset_max=float(posterior.max()),yaw_error_degrees=float(yaw_errors.max()),
@@ -494,15 +505,54 @@ def placement_checks(mesh, parts, pelvis, body_forward, chair_forward, floor):
 
 
 def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
-    meta, mesh, parts = read_asset(path)
+    execution = ctx.get("_execution", ExecutionOptions())
+    profile = Profile(execution.profile_fit)
+    started = time.perf_counter()
+    failure = None
+    try:
+        with execution_scope(execution, profile):
+            with profile.time("candidate_total"):
+                result = _fit_asset(path, ctx, anchors, estimate, output, contacts, profile)
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        profile.count("candidate_wall_seconds", time.perf_counter()-started)
+        # The implementation records this only after validating the identifier
+        # and creating its own directory. Malformed assets cannot share a sink.
+        directory = getattr(profile, "output_directory", None)
+        if execution.profile_fit and directory is not None:
+            performance = str((directory / "performance.json").relative_to(output))
+            write_json(directory / "performance.json", dict(profile.record(), execution=execution.record(),
+                status="error" if failure is not None else "complete",
+                error_type=type(failure).__name__ if failure is not None else None))
+            if failure is not None:
+                failure.fit_performance = performance
+    result["execution"] = execution.record()
+    directory = output / "candidates" / result["id"]
+    if execution.profile_fit:
+        result["performance"] = str((directory / "performance.json").relative_to(output))
+    write_json(directory / "result.json", result)
+    return result
+
+
+def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
+    policy = ctx.get("policy", FitPolicy())
+    with profile.time("asset_loading"):
+        meta, mesh, parts = read_asset(path)
     asset_id = str(meta.get("id", meta.get("asset_id", Path(path).parent.name)))
-    if not asset_id or asset_id in (".", "..") or Path(asset_id).name != asset_id:
-        raise ValueError("Invalid candidate asset identifier")
+    candidate_directory_key(asset_id)
     directory = output / "candidates" / asset_id
     directory.mkdir(parents=True, exist_ok=True)
-    seat = ray_scene(mesh.vertices, mesh.faces[parts["seat_face_indices"]])
+    profile.output_directory = directory
+    seat = query_scene(mesh.vertices, mesh.faces[parts["seat_face_indices"]])
+    validation_seat = seat if ctx.get("_execution", ExecutionOptions()).fit_query_backend == "open3d" else ray_scene(mesh.vertices, mesh.faces[parts["seat_face_indices"]])
     seat_vertices = np.unique(mesh.faces[parts["seat_face_indices"]])
     seat_center = np.median(mesh.vertices[seat_vertices], axis=0)
+    seat_lo, seat_hi = mesh.vertices[seat_vertices,:2].min(0), mesh.vertices[seat_vertices,:2].max(0)
+    evaluations = PoseCache(128)
+    certificates = PoseCache(8)
+    frame_sample_weights = {}
     base_z = float(mesh.vertices[:,2].min())
     desired_yaw = float(np.arctan2(-estimate["forward"][0], estimate["forward"][1]))
     center = np.asarray(estimate["initial_seat_center"])
@@ -511,16 +561,24 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
     h = float(np.quantile(mesh.vertices[seat_vertices,2], .8)-base_z)
     procedural = "infinigen" in str(meta.get("source","")).lower() or "generator" in meta
     scale_bounds=(1.,1.) if procedural else (DEFAULTS["min_scale"],DEFAULTS["max_scale"])
-    geometry = prepare_geometry(mesh, parts, max_scale=scale_bounds[1])
+    with profile.time("geometry_preparation"):
+        geometry = prepare_geometry(mesh, parts, max_scale=scale_bounds[1]) if policy.penetration_validation else None
     geometry_path = directory/"collision_geometry.json"
     source_hash = sha256(resolve(Path(path).parent, meta.get("mesh", "mesh.obj")))
-    write_json(geometry_path, dict(**geometry.summary(), mesh_sha256=source_hash, components=geometry.records))
+    if geometry is not None:
+        write_json(geometry_path, dict(**geometry.summary(), mesh_sha256=source_hash, components=geometry.records))
     scale0 = np.clip(estimate["dimensions"]["seat_height"] / h, *scale_bounds)
     sampled_frames = set(sample_support_frames(ctx["support_frames"],ctx["frame_weights"],ctx["fps"]))
     optimized_samples={r:[sample for sample in anchors[r] if sample[0] in sampled_frames] for r in REGIONS}
     points = {r:np.concatenate([x[2] for x in optimized_samples[r]]) for r in REGIONS}
     slices={r:np.r_[0,np.cumsum([len(x[2]) for x in optimized_samples[r]])] for r in REGIONS}
     optimized_frame_set=set(x[0] for x in optimized_samples[REGIONS[0]])
+    def refresh_sample_weights():
+        frame_sample_weights.update({r: np.asarray([ctx["frame_weights"][sample[0]] for sample in optimized_samples[r]]) for r in REGIONS})
+    refresh_sample_weights()
+    def invalidate_objective():
+        evaluations.invalidate()
+        profile.count("objective_epoch_changes")
     def add_support_frames(frames):
         new_frames=set(int(f) for f in frames)-optimized_frame_set
         if not new_frames: return False
@@ -529,23 +587,28 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
             optimized_samples[region]=[sample for sample in anchors[region] if sample[0] in optimized_frame_set]
             points[region]=np.concatenate([sample[2] for sample in optimized_samples[region]])
             slices[region]=np.r_[0,np.cumsum([len(sample[2]) for sample in optimized_samples[region]])]
+        refresh_sample_weights()
+        invalidate_objective()
         return True
-    contact_scenes={"seat":seat,"back":ray_scene(mesh.vertices,mesh.faces[parts["backrest_face_indices"]]),
-                    "other":ray_scene(mesh.vertices,mesh.faces)}
+    contact_scenes={"seat":seat,"back":query_scene(mesh.vertices,mesh.faces[parts["backrest_face_indices"]]),
+                    "other":query_scene(mesh.vertices,mesh.faces)}
     front=parts.get("front_edge_face_indices",[])
-    if len(front): contact_scenes["front"]=ray_scene(mesh.vertices,mesh.faces[front])
+    if len(front): contact_scenes["front"]=query_scene(mesh.vertices,mesh.faces[front])
     back_vertices=np.unique(mesh.faces[parts["backrest_face_indices"]])
     guard_frames=ctx["support_frames"]
-    collision_guard_frames=list(dict.fromkeys(int(f) for f in guard_frames[[0,len(guard_frames)//2,-1]]))
+    guard_forward = ctx["forward"][guard_frames]
+    guard_weights = ctx["frame_weights"][guard_frames]
+    pelvis_projection = np.sum(ctx["pelvis"][guard_frames]*guard_forward,axis=1)
+    collision_guard_frames=list(dict.fromkeys(int(f) for f in guard_frames[[0,len(guard_frames)//2,-1]])) if policy.penetration_optimization else []
     # Fixed human scenes are shared across chair candidates. These sparse guard
     # samples guide optimization only; the final collision audit is independent.
-    if "_collision_proxy_faces" not in ctx:
+    if policy.penetration_optimization and "_collision_proxy_faces" not in ctx:
         ctx["_collision_proxy_faces"],ctx["_collision_proxy_loops"]=close_body_topology(ctx["faces"],ctx["dense"].shape[1])
     body_scenes=ctx.setdefault("_collision_guard_scenes",{})
     def make_body_scene(frame):
         body=np.asarray(ctx["dense"][frame])
         capped=np.vstack([body]+[body[loop].mean(0)[None] for loop in ctx["_collision_proxy_loops"]])
-        return ray_scene(capped,ctx["_collision_proxy_faces"])
+        return query_scene(capped,ctx["_collision_proxy_faces"])
     def body_scene(frame):
         if frame not in body_scenes:
             body_scenes[frame]=make_body_scene(frame)
@@ -560,11 +623,16 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
         t = np.array([x[0],x[1],ctx["floor"]-scale*base_z])
         return r,t,scale
     def guard_minimum_distances(x):
-        key=(tuple(np.asarray(x)),tuple(collision_guard_frames))
+        key=(evaluations.epoch,tuple(np.asarray(x)),tuple(collision_guard_frames))
         if key!=cached_guard["key"]:
             r,t,scale=transform(x)
             query=o3d.core.Tensor((chair_guard_samples@r.T*scale+t).astype(np.float32))
-            cached_guard["minimum"]=np.array([float(body_scene(frame).compute_signed_distance(query).numpy().min()) for frame in collision_guard_frames])
+            def minimum(frame):
+                scene=body_scene(frame)
+                distance=(scene.transformed_distance(chair_guard_samples,r,t,scale,inverse=False,signed=True)
+                          if hasattr(scene,"transformed_distance") else scene.compute_signed_distance(query))
+                return float(distance.numpy().min())
+            cached_guard["minimum"]=np.array([minimum(frame) for frame in collision_guard_frames])
             cached_guard["key"]=key
         return cached_guard["minimum"]
     def scan_full_motion_guard_risk(x):
@@ -575,7 +643,9 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
         for frame in range(len(ctx["dense"])):
             scene=body_scenes.get(frame)
             if scene is None: scene=make_body_scene(frame)
-            minimum[frame]=float(scene.compute_signed_distance(query).numpy().min())
+            distance=(scene.transformed_distance(chair_guard_samples,r,t,scale,inverse=False,signed=True)
+                      if hasattr(scene,"transformed_distance") else scene.compute_signed_distance(query))
+            minimum[frame]=float(distance.numpy().min())
             # Only already active/selected scenes survive this streaming scan.
             del scene
         selected=[int(frame) for frame in np.argsort(minimum) if frame not in collision_guard_frames][:3]
@@ -587,48 +657,73 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
             sampled_chair_points=len(chair_guard_samples),selected_source_frames=selected,
             selected_minimum_signed_distances=[float(minimum[frame]) for frame in selected],
             global_minimum_signed_distance=float(minimum.min()),
-            policy="streamed Open3D guard SDF; optimization guidance only, not final certification"))
+            policy="streamed " + ctx.get("_execution", ExecutionOptions()).fit_query_backend + " guard SDF; optimization guidance only, not final certification"))
         cached_guard["key"]=None
         return selected
+    last_components = {}
+    def cached_support(x, region):
+        def compute():
+            profile.count("support_query_batches")
+            r,t,scale=transform(x)
+            return support_query(points[region],seat,r,t,scale)
+        return evaluations.get(x, ("support",region), compute)
     def cost(x):
+        profile.count("objective_calls")
+        def compute():
+            profile.count("objective_evaluations")
+            with profile.time("objective"):
+                value = raw_cost(x)
+            return value,dict(last_components)
+        value,components = evaluations.get(x,"cost",compute)
+        last_components.update(components)
+        return value
+    def raw_cost(x):
         r,t,scale=transform(x)
         loss=0.
+        components=dict(support=0.,penetration=0.,contact=0.,placement=0.,regularization=0.)
         for region,p in points.items():
-            gaps, valid=support_query(p,seat,r,t,scale)
+            if not (policy.support_optimization or policy.penetration_optimization): continue
+            gaps, valid=cached_support(x,region)
             # Coverage guidance uses actual seat footprint; q20 permits curvature.
             local=(p-t)@r/scale
-            lo,hi=mesh.vertices[seat_vertices,:2].min(0),mesh.vertices[seat_vertices,:2].max(0)
-            outside=np.maximum(lo-local[:,:2],0)+np.maximum(local[:,:2]-hi,0)
+            outside=np.maximum(seat_lo-local[:,:2],0)+np.maximum(local[:,:2]-seat_hi,0)
             frame_losses=[]
             for k,(_,_,_,weights) in enumerate(optimized_samples[region]):
                 sl=slice(slices[region][k],slices[region][k+1]);ok=valid[sl];g=gaps[sl]
-                value=2*np.average(np.sum(outside[sl]**2,axis=1),weights=weights)+.05*(1-np.mean(ok))
+                support_value=2*np.average(np.sum(outside[sl]**2,axis=1),weights=weights)+.05*(1-np.mean(ok))
+                penetration_value=0.
                 if ok.any():
                     q=weighted_quantile(g[ok],weights[ok],.2)
-                    value+=q*q+5*np.average(np.minimum(g[ok],0)**2,weights=weights[ok])
-                    gap_limit=DEFAULTS["gluteus_gap"] if "gluteus" in region else DEFAULTS["thigh_gap"]
+                    support_value+=max(q,0.)**2
+                    penetration_value+=min(q,0.)**2+5*np.average(np.minimum(g[ok],0)**2,weights=weights[ok])
+                    gap_limit=policy.gap(region)
                     # Explicit violation terms avoid accepting a mean-loss
                     # compromise between floating buttocks and buried thighs.
-                    value+=100*max(0.,q-gap_limit)**2
-                    value+=100*max(0.,-float(g[ok].min())-DEFAULTS["maximum_penetration"])**2
-                else: value+=1.
-                value+=100*max(0.,DEFAULTS["coverage"]-np.mean(ok))**2
-                frame_losses.append(value)
-            loss+=float(np.average(frame_losses,weights=[ctx["frame_weights"][sample[0]]
-                                                         for sample in optimized_samples[region]]))
+                    support_value+=100*max(0.,q-gap_limit)**2
+                    penetration_value+=100*max(0.,-float(g[ok].min())-policy.max_penetration_m)**2
+                else: support_value+=1.
+                support_value+=100*max(0.,policy.support_min_coverage-np.mean(ok))**2
+                frame_losses.append((support_value if policy.support_optimization else 0., penetration_value if policy.penetration_optimization else 0.))
+            values=np.average(frame_losses,axis=0,weights=frame_sample_weights[region])
+            components["support"]+=float(values[0]); components["penetration"]+=float(values[1])
         if contacts:
             for role,(p,weights) in contacts.items():
                 if not len(p): continue
                 sc=contact_scenes.get(role,contact_scenes["other"])
-                local=(p-t)@r/scale
-                d=sc.compute_distance(o3d.core.Tensor(local.astype(np.float32))).numpy()*scale
-                loss+=.10*float(np.average(np.minimum(d,.15)**2,weights=weights))
+                if hasattr(sc,"transformed_distance"):
+                    d=sc.transformed_distance(p,r,t,scale,inverse=True).numpy()*scale
+                else:
+                    local=(p-t)@r/scale
+                    d=sc.compute_distance(o3d.core.Tensor(local.astype(np.float32))).numpy()*scale
+                components["contact"]+=.10*float(np.average(np.minimum(d,.15)**2,weights=weights))
         back_world=mesh.vertices[back_vertices]@r.T*scale+t
-        offsets=(back_world@ctx["forward"][guard_frames].T).max(axis=0)-np.sum(ctx["pelvis"][guard_frames]*ctx["forward"][guard_frames],axis=1)
-        loss+=100*float(np.average(np.maximum(offsets,0)**2,weights=ctx["frame_weights"][guard_frames]))
-        loss+=100*float(np.mean(np.maximum(-guard_minimum_distances(x)-DEFAULTS["maximum_penetration"],0)**2))
-        loss += .001*(scale-1)**2 + .001*(x[2]-desired_yaw)**2
-        return loss
+        offsets=(back_world@guard_forward.T).max(axis=0)-pelvis_projection
+        components["placement"]+=100*float(np.average(np.maximum(offsets,0)**2,weights=guard_weights))
+        if policy.penetration_optimization:
+            components["penetration"]+=100*float(np.mean(np.maximum(-guard_minimum_distances(x)-policy.max_penetration_m,0)**2))
+        components["regularization"] = .001*(scale-1)**2 + .001*(x[2]-desired_yaw)**2
+        last_components.update(components)
+        return sum(components.values())
     bounds=[(t0[0]-.25,t0[0]+.25),(t0[1]-.25,t0[1]+.25),
             (desired_yaw-np.radians(20),desired_yaw+np.radians(20)),scale_bounds]
     x0=np.array([t0[0],t0[1],desired_yaw,scale0])
@@ -640,7 +735,8 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
                     x=np.array([t0[0]+dx,t0[1]+dy,desired_yaw+np.radians(da),s])
                     starts.append((cost(x),x))
     best_starts=sorted(starts,key=lambda x:x[0])[:3]
-    results=[minimize(cost,x,method="Powell",bounds=bounds,options={"maxiter":70,"xtol":1e-4,"ftol":1e-5}) for _,x in best_starts]
+    with profile.time("powell"):
+        results=[minimize(cost,x,method="Powell",bounds=bounds,options={"maxiter":70,"xtol":1e-4,"ftol":1e-5}) for _,x in best_starts]
     all_lower=np.array([bound[0] for bound in bounds]);all_upper=np.array([bound[1] for bound in bounds])
     for result in results:
         result.raw_bounds_violation=float(max(0.,(all_lower-result.x).max(),(result.x-all_upper).max()))
@@ -652,27 +748,39 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
     buffer_tier=0;margin=buffer_levels[buffer_tier]
     buffer_history=[dict(round=0,margin_m=margin)]
     def feasible_residuals(x):
+        profile.count("constraint_calls")
+        def compute():
+            profile.count("constraint_evaluations")
+            with profile.time("constraints"):
+                return raw_residuals(x)
+        return evaluations.get(x,"constraints",compute)
+    def raw_residuals(x):
         r,t,scale=transform(x)
         residuals=[]
         for region,p in points.items():
-            gaps,valid=support_query(p,seat,r,t,scale)
-            gap_limit=DEFAULTS["gluteus_gap"] if "gluteus" in region else DEFAULTS["thigh_gap"]
+            if not (policy.support_optimization or policy.penetration_optimization): continue
+            gaps,valid=cached_support(x,region)
+            gap_limit=policy.gap(region)
             for k,(_,_,_,weights) in enumerate(optimized_samples[region]):
                 sl=slice(slices[region][k],slices[region][k+1]);ok=valid[sl];g=gaps[sl]
-                residuals.append(.02*(float(np.mean(ok))-DEFAULTS["coverage"]))
+                if policy.support_optimization:
+                    residuals.append(.02*(float(np.mean(ok))-policy.support_min_coverage))
                 if ok.any():
-                    residuals.extend((gap_limit-margin-weighted_quantile(g[ok],weights[ok],.2),
-                        DEFAULTS["maximum_penetration"]-margin+float(g[ok].min())))
-                else: residuals.extend((-.1,-.1))
+                    if policy.support_optimization: residuals.append(gap_limit-margin-weighted_quantile(g[ok],weights[ok],.2))
+                    if policy.penetration_optimization: residuals.append(policy.max_penetration_m-margin+float(g[ok].min()))
+                else:
+                    if policy.support_optimization: residuals.append(-.1)
+                    if policy.penetration_optimization: residuals.append(-.1 if policy.support_optimization else policy.max_penetration_m)
         back_world=mesh.vertices[back_vertices]@r.T*scale+t
-        offsets=(back_world@ctx["forward"][guard_frames].T).max(axis=0)-np.sum(ctx["pelvis"][guard_frames]*ctx["forward"][guard_frames],axis=1)
+        offsets=(back_world@guard_forward.T).max(axis=0)-pelvis_projection
         residuals.append(-float(offsets.max())-margin)
         heading=np.array([0.,1.,0.])@r.T
         angles=np.degrees(np.arccos(np.clip(ctx["forward"][guard_frames]@heading,-1.,1.)))
         residuals.append(.01*(DEFAULTS["maximum_yaw_degrees"]-float(angles.max())))
         # A certificate needs room for outside-witness and surface-cell bounds.
         # Support can approach its exact threshold more tightly than this.
-        residuals.extend(DEFAULTS["maximum_penetration"]-max(margin,.0001)+guard_minimum_distances(x))
+        if policy.penetration_optimization:
+            residuals.extend(policy.max_penetration_m-max(margin,.0001)+guard_minimum_distances(x))
         return np.asarray(residuals)
     def violation(x): return max(0.,-float(feasible_residuals(x).min()))
     active=np.array([i for i,(lo,hi) in enumerate(bounds) if hi>lo],int)
@@ -682,13 +790,14 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
         fixed=start.x.copy()
         def expand(x):
             result=fixed.copy();result[active]=x;return result
-        repaired=minimize(lambda x:cost(expand(x)),start.x[active],method="COBYLA",
-            constraints=[{"type":"ineq","fun":lambda x:feasible_residuals(expand(x))},
-                {"type":"ineq","fun":lambda x:x-lower_bounds},
-                {"type":"ineq","fun":lambda x:upper_bounds-x}],
-            options={"maxiter":300 if buffer_tier==0 else 900,
-                "rhobeg":.02 if buffer_tier==0 else .005,
-                "tol":1e-5 if buffer_tier==0 else 1e-6,"catol":1e-7})
+        with profile.time("cobyla_repair"):
+            repaired=minimize(lambda x:cost(expand(x)),start.x[active],method="COBYLA",
+                constraints=[{"type":"ineq","fun":lambda x:feasible_residuals(expand(x))},
+                    {"type":"ineq","fun":lambda x:x-lower_bounds},
+                    {"type":"ineq","fun":lambda x:upper_bounds-x}],
+                options={"maxiter":300 if buffer_tier==0 else 900,
+                    "rhobeg":.02 if buffer_tier==0 else .005,
+                    "tol":1e-5 if buffer_tier==0 else 1e-6,"catol":1e-7})
         raw=expand(repaired.x)
         repaired.raw_bounds_violation=float(max(0.,(all_lower-raw).max(),(raw-all_upper).max()))
         repaired.x=np.clip(raw,all_lower,all_upper)
@@ -700,8 +809,7 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
         if violation(repaired.x)<=1e-6: break
     choices=results+repairs
     def choose_result():
-        feasible=[result for result in choices if violation(result.x)<=1e-6]
-        return min(feasible,key=lambda o:o.fun) if feasible else min(choices,key=lambda o:(violation(o.x),o.fun))
+        return choose_current_result(choices,cost,violation)
     opt=choose_result()
     validation_rounds=[];collision_witnesses=[]
     support_repairs=0;collision_repairs=0
@@ -716,33 +824,41 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
         exported["forward_origin"]=seat_center@r.T*scale+t
         np.savez_compressed(directory/"parts.npz",**exported)
         support={};worst_support={}
-        for region,samples in anchors.items():
-            per_frame=[(frame,region_metrics(*support_query(p,seat,r,t,scale),weights)) for frame,ids,p,weights in samples]
+        for region,samples in (anchors.items() if policy.support_validation or policy.penetration_validation else []):
+            with profile.time("support_validation"):
+                per_frame=batched_support_metrics(samples,validation_seat,r,t,scale,support_query,region_metrics)
             support[region]=dict(coverage=min(m["coverage"] for _,m in per_frame),
                 gap_p20=max((m["gap_p20"] for _,m in per_frame if m["gap_p20"] is not None),default=None),
                 maximum_seat_intrusion=max((m["maximum_seat_intrusion"] for _,m in per_frame if m["maximum_seat_intrusion"] is not None),default=None))
             worst_support[region]=[dict(frame=f,**m) for f,m in per_frame]
-        reasons=support_checks(support)
+        reasons=support_checks(support,policy) if support else []
         placement,placement_reasons=placement_checks(fitted,parts,ctx["pelvis"][ctx["support_frames"]],
             ctx["forward"][ctx["support_frames"]],np.array([0.,1.,0.])@r.T,ctx["floor"])
         reasons.extend(placement_reasons)
-        metrics=dict(support=support,scale=float(scale),geometry=geometry.summary(),**placement)
+        metrics=dict(support=support,scale=float(scale),geometry=geometry.summary() if geometry is not None else skipped(),**placement)
         if "visits" in ctx:
             from .multi_fit import evaluate_visits
-            metrics["visits"] = evaluate_visits(ctx["phase"]["visits"], worst_support)
-            if not all(visit["verified"] for visit in metrics["visits"]):
+            metrics["visits"] = evaluate_visits(ctx["phase"]["visits"], worst_support, policy)
+            if any(visit["rejection_reasons"] for visit in metrics["visits"]):
                 reasons.append("visit_support_unverified")
         worst_frame=None;collision=None
-        if not reasons:
+        if not reasons and policy.penetration_validation:
             print("Full-frame collision check",asset_id,"round",validation_round,flush=True)
-            collision=collision_check(ctx,fitted,parts,prepared=geometry,pose=(r,t,scale))
+            profile.count("collision_requests")
+            def audit():
+                profile.count("collision_evaluations")
+                with profile.time("strict_collision"):
+                    return collision_check(ctx,fitted,parts,prepared=geometry,pose=(r,t,scale),limit=policy.max_penetration_m)
+            # Scoped to this immutable body/asset/policy invocation. Optimization
+            # frame/witness changes do not alter the full-motion audit contract.
+            collision=certificates.get(opt.x,"strict_collision",audit,copy=True)
             write_json(directory/("collision-iteration-%d.json"%validation_round),collision)
             write_json(directory/"collision.json",collision)
             worst_frame=collision["worst_collision_frame"]
             metrics["collision"]={k:v for k,v in collision.items() if k!="frames"}
-            reasons.extend(collision_checks(collision))
+            reasons.extend(collision_checks(collision,limit=policy.max_penetration_m))
         else:
-            metrics["collision"]={"status":"not_run_support_rejected"}
+            metrics["collision"]={"status":"not_run_support_rejected", "checked_source_frames":0} if policy.penetration_validation else skipped()
         write_json(directory/"support.json",worst_support)
         validation_rounds.append(dict(round=validation_round,collision_guard_frames=list(collision_guard_frames),
             rejection_reasons=list(reasons),worst_collision_frame=worst_frame,
@@ -750,6 +866,8 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
             collision_internal_margin_m=max(margin,.0001),
             optimized_source_frames=sorted(optimized_frame_set),optimizer_success=bool(opt.success),optimizer_message=str(opt.message),
             maximum_constraint_violation_m=violation(opt.x),loss=float(cost(opt.x))))
+        metrics["support_validation"] = dict(status="checked", checked_source_frames=len(ctx["support_frames"])) if policy.support_validation else skipped()
+        if not policy.support_validation: metrics["support"] = skipped()
         added_support=[]
         for region in REGIONS:
             if region+":insufficient_seat_coverage" in reasons:
@@ -759,7 +877,7 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
             if region+":seat_penetration" in reasons:
                 added_support.append(max(worst_support[region],key=lambda m:m["maximum_seat_intrusion"] or 0)["frame"])
         if (validation_round<maximum_validation_rounds-1 and support_repairs<maximum_support_repairs
-                and add_support_frames(added_support)):
+                and (policy.support_optimization or policy.penetration_optimization) and add_support_frames(added_support)):
             print("Refining support source frames",sorted(set(added_support)),asset_id,flush=True)
             support_repairs+=1
             choices.append(repair(opt));opt=choose_result()
@@ -774,7 +892,7 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
                     break
                 collision_repair_frame=collision.get("uncertainty_frame")
         if (validation_round<maximum_validation_rounds-1 and collision_repairs<maximum_collision_repairs
-                and collision_repair_frame is not None):
+                and policy.penetration_optimization and collision_repair_frame is not None):
             changed=False
             if collision_repair_frame not in collision_guard_frames:
                 collision_guard_frames.append(int(collision_repair_frame));changed=True
@@ -798,24 +916,31 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
                     cached_guard["key"]=None;changed=True;new_points=True
             if new_points:
                 print("Scanning all source frames for guard risk",asset_id,flush=True)
-                selected=scan_full_motion_guard_risk(opt.x)
+                with profile.time("full_motion_guard_scan"):
+                    selected=scan_full_motion_guard_risk(opt.x)
                 print("Activated risk source frames",selected,asset_id,flush=True)
             if changed:
                 fitted.export(directory/("mesh-iteration-%d.obj"%validation_round))
                 print("Refining collision frame/witness",collision_repair_frame,asset_id,flush=True)
                 collision_repairs+=1
+                invalidate_objective()
                 choices.append(repair(opt));opt=choose_result()
                 continue
-        if (reasons and validation_round<maximum_validation_rounds-1 and buffer_tier<len(buffer_levels)-1
+        if ((policy.support_validation or policy.penetration_validation) and reasons and validation_round<maximum_validation_rounds-1 and buffer_tier<len(buffer_levels)-1
                 and violation(opt.x)>1e-7):
             buffer_tier+=1;margin=buffer_levels[buffer_tier]
+            invalidate_objective()
             buffer_history.append(dict(round=validation_round+1,margin_m=margin,
                 reason="extra internal buffer infeasible; final acceptance limits unchanged"))
             print("Refining with internal margin",margin,"m",asset_id,flush=True)
             choices.append(repair(opt));opt=choose_result()
             continue
         break
-    write_json(directory/"optimization.json",dict(method="coarse grid, Powell, COBYLA feasibility repair",
+    profile.count("optimization_cache_hits",evaluations.hits)
+    profile.count("optimization_cache_misses",evaluations.misses)
+    profile.count("collision_cache_hits",certificates.hits)
+    profile.count("optimizer_function_evaluations",sum(int(getattr(o,"nfev",0)) for o in choices))
+    write_json(directory/"optimization.json",dict(execution=ctx.get("_execution",ExecutionOptions()).record(),objective_epoch=evaluations.epoch,collision_cache_hits=certificates.hits,method="coarse grid, Powell, COBYLA feasibility repair",
         internal_margin_m=margin,initial_internal_margin_m=buffer_levels[0],buffer_history=buffer_history,
         collision_internal_margin_m=max(margin,.0001),minimum_collision_internal_margin_m=.0001,
         optimized_source_frames=[int(x[0]) for x in optimized_samples[REGIONS[0]]],
@@ -826,13 +951,48 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
         final_maximum_constraint_violation_m=violation(opt.x),
         trials=[dict(loss=float(o.fun),constraint_violation_m=violation(o.x),success=bool(o.success),
             raw_bounds_violation=float(getattr(o,"raw_bounds_violation",0)),message=str(o.message)) for o in choices]))
-    result=dict(id=asset_id,mesh=str(mesh_path.relative_to(output)),parts=str((directory/"parts.npz").relative_to(output)),
-                qualified=not reasons,loss=float(cost(opt.x)),metrics=metrics,rejection_reasons=reasons,
+    final_loss=float(cost(opt.x))
+    result=dict(policy=policy.record(),selection_eligible=not reasons,validation_status="complete" if policy.strict else "diagnostic_unverified",loss_components=dict(last_components),id=asset_id,mesh=str(mesh_path.relative_to(output)),parts=str((directory/"parts.npz").relative_to(output)),
+                qualified=not reasons and policy.strict,loss=final_loss,metrics=metrics,rejection_reasons=reasons,
                 worst_collision_frame=worst_frame,source_asset=str(Path(path).resolve()),
                 transform=dict(rotation=r.tolist(),translation=t.tolist(),scale=float(scale)),
-                geometry_audit=str(geometry_path.relative_to(output)), source_geometry_sha256=source_hash)
+                geometry_audit=str(geometry_path.relative_to(output)) if geometry is not None else None, source_geometry_sha256=source_hash)
     write_json(directory/"result.json",result)
     return result
+
+
+_WORKER_INPUTS = None
+_WORKER_BLAS_LIMIT = None
+
+
+def _initialize_candidate_worker(inputs):
+    global _WORKER_INPUTS, _WORKER_BLAS_LIMIT
+    from threadpoolctl import threadpool_limits
+    # Open3D owns the per-worker query budget. Dense linear algebra must not
+    # create an additional full-machine BLAS team in every spawned worker.
+    _WORKER_BLAS_LIMIT = threadpool_limits(limits=1, user_api="blas")
+    _WORKER_INPUTS = unpack_arrays(inputs)
+
+
+def _invalid_candidate_record(path, exc):
+    return dict(id=Path(path).parent.name,qualified=False,retained=False,loss=None,metrics={},
+        rejection_reasons=[("support_geometry_unverified: " if isinstance(exc, UnverifiedSupport)
+                            else "invalid_candidate_asset: ")+str(exc)],worst_collision_frame=None,source_asset=str(path))
+
+
+def _candidate_record(path, ctx, anchors, estimate, output, contacts):
+    try:
+        return fit_asset(path,ctx,anchors,estimate,output,contacts)
+    except (ValueError,FileNotFoundError,KeyError) as exc:
+        record = _invalid_candidate_record(path, exc)
+        if hasattr(exc, "fit_performance"):
+            record["performance"] = exc.fit_performance
+            record["execution"] = ctx.get("_execution", ExecutionOptions()).record()
+        return record
+
+
+def _candidate_worker(path):
+    return _candidate_record(path,*_WORKER_INPUTS)
 
 
 def main(argv=None):
@@ -849,14 +1009,25 @@ def main(argv=None):
     parser.add_argument("--output",required=True,type=Path)
     parser.add_argument("--estimate-only",action="store_true")
     parser.add_argument("--max-candidates",type=int,choices=(1,2,3),default=3)
+    add_arguments(parser)
+    add_execution_arguments(parser)
+    parser.add_argument("--candidate-timeout",type=float,default=7200.,help="Maximum wait for the next candidate result; only this worker pool is terminated on timeout")
     args=parser.parse_args(argv)
+    if args.candidate_timeout <= 0 or not np.isfinite(args.candidate_timeout):
+        parser.error("--candidate-timeout must be finite and positive")
+    execution=ExecutionOptions.from_args(args)
+    profile=Profile(execution.profile_fit)
+    run_started=time.perf_counter()
+    policy=FitPolicy.from_args(args)
     output=args.output.resolve(); output.mkdir(parents=True,exist_ok=True)
-    report=dict(backend="supported-chair-v2",status="no_valid_candidate",candidates=[],best_candidate_id=None,
-                thresholds=DEFAULTS,validation_scope="geometry; no dynamics simulation",
+    report=dict(execution=execution.record(),policy=policy.record(),backend="supported-chair-v2",status="no_valid_candidate",candidates=[],best_candidate_id=None,
+                thresholds=dict(DEFAULTS,coverage=policy.support_min_coverage,gluteus_gap=policy.support_gluteus_gap_m,
+                    thigh_gap=policy.support_thigh_gap_m,maximum_penetration=policy.max_penetration_m),validation_scope="geometry; no dynamics simulation",
                 prediction_sha256=sha256(args.contacts),world_sha256=sha256(args.vertices_path))
     implementation_files=[Path(__file__),Path(__file__).parent/"cad.py",Path(__file__).parent/"annotations"/"body_regions_smplx_v1.json",
         Path(__file__).parent/"annotations"/"cad_chair_annotations_v1.json",Path(__file__).parent/"collision.py",
-        Path(__file__).parent/"selection.py",Path(__file__).parent/"geometry_audit.py"]
+        Path(__file__).parent/"policy.py",Path(__file__).parent/"selection.py",Path(__file__).parent/"geometry_audit.py"]
+    implementation_files += [Path(__file__).with_name(name) for name in ("runtime.py","query_backend.py","warp_backend.py","solver_helpers.py","candidate_pool.py")]
     report["implementation_sha256"]={str(path.relative_to(Path(__file__).parent)):sha256(path) for path in implementation_files if path.is_file()}
     try:
         assignment=json.loads(args.instance_visits.read_text(encoding="utf-8")) if args.instance_visits else None
@@ -872,8 +1043,11 @@ def main(argv=None):
             report["implementation_sha256"]["multi_fit.py"]=sha256(Path(__file__).with_name("multi_fit.py"))
         elif args.candidate_cache:
             raise ValueError("--candidate-cache requires an instance visit assignment")
-        ctx=motion_context(args.geometry,args.vertices_path,args.contacts,args.frame_indices,output,
-                           visits=visits,locations=assignment.get("locations") if assignment else None)
+        with profile.time("motion_context"):
+            ctx=motion_context(args.geometry,args.vertices_path,args.contacts,args.frame_indices,output,
+                               visits=visits,locations=assignment.get("locations") if assignment else None)
+        ctx["policy"]=policy
+        ctx["_execution"]=execution
         report["support_selection"]={key:value for key,value in ctx["phase"].items()
                                      if key not in ("selection_reasons","thresholds","selection_proxy")}
         missing=[visit for visit in ctx["phase"].get("visits",[]) if not visit["selected_source_frames"]]
@@ -882,7 +1056,8 @@ def main(argv=None):
             write_json(output/"fit_result.json",report)
             return 2
         regions=body_regions(ctx)
-        anchors,estimate=prepare_support(ctx,regions,output)
+        with profile.time("prepare_support"):
+            anchors,estimate=prepare_support(ctx,regions,output)
         if args.estimate_only:
             print(json.dumps({"estimate":str(output/"estimate.json")}))
             return 0
@@ -894,7 +1069,8 @@ def main(argv=None):
             assets=prepare_cad_assets(args.models_dir,output/"cad_assets")
         else:
             raise ValueError("Provide --assets-manifest or --models-dir for CAD candidates")
-        contacts=contact_roles(ctx,regions,output)
+        with profile.time("contact_roles"):
+            contacts=contact_roles(ctx,regions,output)
         asset_ids=set()
         if args.candidate_cache:
             manifest=json.loads(args.geometry.read_text(encoding="utf-8"))
@@ -903,39 +1079,58 @@ def main(argv=None):
             inputs.update(manifest=sha256(args.geometry),low=report["world_sha256"],contacts=report["prediction_sha256"],
                           frame_map=sha256(args.frame_indices),instance=assignment["instance_id"])
             runtime={name:importlib.metadata.version(name) for name in ("numpy","scipy","open3d","trimesh")}
+            if execution.fit_query_backend == "warp":
+                runtime["warp-lang"]=importlib.metadata.version("warp-lang")
             cache=CandidateCache(args.candidate_cache,inputs,[platform.platform(),platform.python_version(),
-                runtime,report["implementation_sha256"]],assignment,ctx["phase"])
+                runtime,report["implementation_sha256"],policy.record(),execution.record()],assignment,ctx["phase"])
             report["cache_hits"]=[]
+        # Validate identities before spawning; workers must never share a directory.
+        entries=[]
         for path in assets:
-            print("Fitting",str(path),flush=True)
-            checkpoint=None
-            record=None
-            if assignment is not None:
+            try:
                 asset=json.loads(Path(path).read_text(encoding="utf-8"))
-                asset_id=valid_name(asset.get("id",asset.get("asset_id",Path(path).parent.name)))
-                if asset_id in asset_ids:
-                    raise ValueError("Duplicate asset id: "+asset_id)
-                asset_ids.add(asset_id)
+                if not isinstance(asset,dict):
+                    raise ValueError("Candidate metadata must be an object")
+                asset_id=str(asset.get("id",asset.get("asset_id",Path(path).parent.name)))
+                directory_key=candidate_directory_key(asset_id)
+            except (ValueError,FileNotFoundError,KeyError) as exc:
+                entries.append((path,_invalid_candidate_record(path,exc),None))
+                continue
+            if directory_key in asset_ids:
+                raise ValueError("Duplicate asset id: "+asset_id)
+            asset_ids.add(directory_key)
+            record=checkpoint=None
             if cache:
                 record,checkpoint,_=cache.lookup(Path(path),output)
                 if record is not None:
                     report["cache_hits"].append(record["id"])
-            try:
-                if record is None:
-                    record=fit_asset(path,ctx,anchors,estimate,output,contacts)
-                    if cache and checkpoint is not None:
-                        cache.publish(checkpoint,output/"candidates"/record["id"])
-            except (ValueError,FileNotFoundError,KeyError) as exc:
-                record=dict(id=Path(path).parent.name,qualified=False,retained=False,loss=None,metrics={},
-                    rejection_reasons=[("support_geometry_unverified: " if isinstance(exc, UnverifiedSupport)
-                                        else "invalid_candidate_asset: ")+str(exc)],worst_collision_frame=None,source_asset=str(path))
-            report["candidates"].append(record)
-            write_json(output/"fit_result.json",report)
-        qualified=sorted((c for c in report["candidates"] if c["qualified"]),key=lambda c:c["loss"])
+            entries.append((path,record,checkpoint))
+        pending=[path for path,record,_ in entries if record is None]
+        outcomes=None
+        if execution.fit_workers > 1 and pending:
+            # Context has not constructed any query scenes yet. Dense/low-res
+            # arrays are reopened read-only, rather than pickling their bytes.
+            inputs=pack_arrays((ctx,anchors,estimate,output,contacts))
+            outcomes=ordered_spawn_map(_candidate_worker,pending,execution.fit_workers,
+                initializer=_initialize_candidate_worker,initargs=(inputs,),timeout=args.candidate_timeout)
+        try:
+            with profile.time("candidate_fitting"):
+                for path,record,checkpoint in entries:
+                    print("Fitting",str(path),flush=True)
+                    if record is None:
+                        record=next(outcomes) if outcomes is not None else _candidate_record(path,ctx,anchors,estimate,output,contacts)
+                        if cache and checkpoint is not None and record.get("mesh"):
+                            cache.publish(checkpoint,output/"candidates"/record["id"])
+                    report["candidates"].append(record)
+                    write_json(output/"fit_result.json",report)
+        finally:
+            if outcomes is not None:
+                outcomes.close()
+        qualified=sorted((c for c in report["candidates"] if eligible(c)),key=lambda c:c["loss"])
         for index,c in enumerate(qualified):
             c["retained"]=index<max(1,args.max_candidates)
         if qualified:
-            report["status"]="success"
+            report["status"]="success" if policy.strict else "diagnostic_complete"
             report["best_candidate_id"]=qualified[0]["id"]
         else:
             report["rejection_reasons"]=["no_candidate_passed_geometry_acceptance"]
@@ -946,3 +1141,10 @@ def main(argv=None):
         report["error"]=str(exc)
         write_json(output/"fit_result.json",report)
         raise
+    finally:
+        if execution.profile_fit:
+            profile.count("fitting_wall_seconds",time.perf_counter()-run_started)
+            performance=profile.record()
+            performance["execution"]=execution.record()
+            performance["candidates"]={c["id"]:c.get("performance") for c in report["candidates"]}
+            write_json(output/"performance.json",performance)

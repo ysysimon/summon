@@ -14,7 +14,7 @@ from .query_backend import cpu_scene
 NUMERIC_MARGIN = 1e-5
 PROXY_ERROR = .002
 PROXY_QUERY_BUDGET = 250_000
-PART_NAMES = {0: "seat", 1: "backrest", 2: "base"}
+PART_NAMES = {0: "seat", 1: "backrest", 2: "base", 3: "armrest"}
 
 
 def ray_scene(vertices, faces):

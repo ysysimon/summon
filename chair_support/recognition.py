@@ -134,10 +134,10 @@ def _kinematics(joints, names, fps):
     return pelvis, forward[:, :2], np.asarray(thigh_angles), np.asarray(knee_angles), speed
 
 
-def _visits(dense, faces, joints, names, labels, indices, fps):
+def _visits(dense, faces, joints, names, labels, indices, fps, seat_labels=(3, 4)):
     pelvis, forward, thigh, knee, speed = _kinematics(joints, names, fps)
     times = np.arange(len(pelvis))
-    seat_counts = np.isin(labels, (3, 4)).sum(axis=1)
+    seat_counts = np.isin(labels, seat_labels).sum(axis=1)
     contacts = np.interp(times, indices, seat_counts) >= DEFAULTS["min_chair_vertices"]
     thigh_max = thigh.max(axis=0)
     bent = (knee.min(axis=0) >= DEFAULTS["min_knee_degrees"]) & (
@@ -356,7 +356,7 @@ def assign_locations(visits):
     return instances, ambiguities
 
 
-def recognize(manifest_path, vertices_path, contacts_path, indices_path, *, case_id=None, baseline=False):
+def recognize(manifest_path, vertices_path, contacts_path, indices_path, *, case_id=None, baseline=False, seating=False):
     path = Path(manifest_path)
     manifest = json.loads(path.read_text(encoding="utf-8"))
     fit = manifest["fitting_data"]
@@ -427,8 +427,12 @@ def recognize(manifest_path, vertices_path, contacts_path, indices_path, *, case
         raise ValueError("Invalid ContactFormer labels or source-frame grid")
     labels = labels.reshape(-1, 655)
     conversion = manifest["conversion"]
-    visits, unverified = _visits(dense, faces, joints, names, labels, indices, fps)
+    visits, unverified = _visits(dense, faces, joints, names, labels, indices, fps,
+                                 seat_labels=(3, 4, 7) if seating else (3, 4))
     instances, ambiguities = assign_locations(visits)
+    if seating:
+        from .seating import classify_locations
+        instances, visits = classify_locations(instances, visits, labels, indices)
     report = dict(
         version=1,
         method="time-bounded stable visits + world-space DBSCAN",
@@ -455,6 +459,11 @@ def recognize(manifest_path, vertices_path, contacts_path, indices_path, *, case
     )
     if baseline:
         report["original_dbscan"] = original_clusters(world, labels, indices)
+    if seating:
+        from copy import deepcopy
+        report.update(version=2, locations=deepcopy(instances), furniture_instance_count=len(instances),
+                      hypothesis="independent category-aware seating", category_policy="support-sample votes; stable raw-label tie break")
+        report.pop("chair_instance_count", None)
     return report
 
 
@@ -467,6 +476,7 @@ def main(argv=None):
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--case-id")
     parser.add_argument("--baseline", action="store_true")
+    parser.add_argument("--seating", action="store_true")
     args = parser.parse_args(argv)
     report = recognize(
         args.geometry,
@@ -475,6 +485,7 @@ def main(argv=None):
         args.frame_indices,
         case_id=args.case_id,
         baseline=args.baseline,
+        seating=args.seating,
     )
     args.output.parent.mkdir(exist_ok=True, parents=True)
     write_json(args.output, report)

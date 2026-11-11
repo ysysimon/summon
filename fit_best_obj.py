@@ -19,12 +19,17 @@ from utils import read_mpcat40, pred_subset_to_mpcat40, estimate_floor_height, r
 
 
 if __name__ == "__main__":
+    if threads := os.environ.get("YSYNTHETIC_TORCH_THREADS"):
+        torch.set_num_threads(int(threads))
+        torch.set_num_interop_threads(1)
     parser = argparse.ArgumentParser(description="")
     parser.add_argument("--sequence_name", type=str)
     parser.add_argument("--vertices_path", type=str)
     parser.add_argument("--contact_labels_path", type=str)
     parser.add_argument("--output_dir", type=str)
     parser.add_argument("--models_dir", default="3D_Future/models")
+    parser.add_argument("--fixed_catalog", action="store_true",
+                        help="Skip detected object classes that have no supplied candidates")
     parser.add_argument("--faces_path", default=os.path.join(os.path.dirname(__file__), "mesh_ds", "mesh_2.obj"))
     parser.add_argument("--frame_indices", help="NPY source-frame indices corresponding to contact predictions")
     parser.add_argument("--seed", type=int, default=0)
@@ -226,6 +231,9 @@ if __name__ == "__main__":
         obj_idx = objects_indices[i]
         obj_class_str = label_names[obj_c]
         obj_class_path = os.path.join(args.models_dir, obj_class_str)
+        if args.fixed_catalog and not os.path.isdir(obj_class_path):
+            print("No supplied candidates for", obj_class_str)
+            continue
         print("Object class", obj_class_str, "Object index", obj_idx, "Num points", cluster_points.shape[0])
         print()
         cluster_base_path = os.path.join(output_dir, sequence_name, "fit_best_obj", obj_class_str, str(obj_idx))

@@ -3,14 +3,15 @@ import argparse
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import os
 import time
+import math
 
 
-def available_cpus():
+def available_cpu_ids():
     try:
-        return len(os.sched_getaffinity(0))
+        return tuple(sorted(os.sched_getaffinity(0)))
     except AttributeError:
         if os.name == "nt":
             import ctypes
@@ -19,8 +20,12 @@ def available_cpus():
             kernel.GetCurrentProcess.restype = ctypes.c_void_p
             kernel.GetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
             if kernel.GetProcessAffinityMask(kernel.GetCurrentProcess(), ctypes.byref(mask), ctypes.byref(system)):
-                return bin(mask.value).count("1")
-        return os.cpu_count() or 1
+                return tuple(index for index in range(mask.value.bit_length()) if mask.value & (1 << index))
+        return tuple(range(os.cpu_count() or 1))
+
+
+def available_cpus():
+    return len(available_cpu_ids())
 
 
 @dataclass(frozen=True)
@@ -30,20 +35,41 @@ class ExecutionOptions:
     generator_workers: int = 1
     query_threads: int = 0
     fit_query_backend: str = "open3d"
+    collision_sampling: str = "legacy"
+    collision_max_edge_m: float = .05
+    fit_objective: str = "collision-first"
+    cpu_budget: int = 0
+    auto_fit_workers: bool = False
+    gpu_workers: int = 1
+    penetration_weight: float = 1.0
 
     def __post_init__(self):
-        for name in ("fit_workers", "generator_workers"):
+        available = available_cpus()
+        for name in ("fit_workers", "generator_workers", "gpu_workers"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(name + " must be a positive integer")
         if type(self.query_threads) is not int or self.query_threads < 0:
             raise ValueError("query_threads must be nonnegative")
-        if self.fit_query_backend not in ("open3d", "warp"):
+        if type(self.cpu_budget) is not int or not 0 <= self.cpu_budget <= available:
+            raise ValueError("cpu_budget exceeds available CPUs or is negative")
+        if self.fit_query_backend not in ("open3d", "warp", "hybrid"):
             raise ValueError("Unknown fitting query backend")
+        if self.collision_sampling not in ("legacy", "longest-edge"):
+            raise ValueError("Unknown collision sampler")
+        if not math.isfinite(self.collision_max_edge_m) or self.collision_max_edge_m <= 0:
+            raise ValueError("collision_max_edge_m must be finite and positive")
+        if self.fit_objective not in ("balanced", "collision-first"):
+            raise ValueError("Unknown fitting objective")
+        if not math.isfinite(self.penetration_weight) or self.penetration_weight <= 0:
+            raise ValueError("penetration_weight must be finite and positive")
         if self.fit_query_backend == "warp" and self.fit_workers != 1:
             raise ValueError("The experimental Warp backend requires --fit-workers 1")
-        if self.fit_workers > available_cpus():
+        if self.cpu_budget and self.fit_query_backend == "hybrid" and self.fit_workers > self.gpu_workers:
+            raise ValueError("candidate_workers for hybrid cannot exceed execution.gpu_workers")
+        budget = self.cpu_budget or available
+        if self.fit_workers > budget:
             raise ValueError("fit_workers exceeds available CPU budget")
-        if self.query_threads and self.query_threads * self.fit_workers > available_cpus():
+        if self.query_threads * self.fit_workers > budget:
             raise ValueError("fit_workers * query_threads exceeds available CPU budget")
 
     @classmethod
@@ -53,16 +79,40 @@ class ExecutionOptions:
     def resolved_query_threads(self):
         if self.query_threads:
             return self.query_threads
+        if self.cpu_budget:
+            return self.cpu_budget // self.fit_workers
         return 0 if self.fit_workers == 1 else max(1, available_cpus() // self.fit_workers)
 
+    def for_candidates(self, pending_count):
+        """Resolve the worker allocation once cache hits and invalid candidates are known."""
+        if not self.cpu_budget or not pending_count:
+            return self
+        workers = self.fit_workers
+        if self.auto_fit_workers:
+            limit = {"open3d": 4, "hybrid": self.gpu_workers, "warp": 1}[self.fit_query_backend]
+            workers = min(limit, max(1, self.cpu_budget // (self.query_threads or 2)))
+        workers = min(workers, pending_count)
+        return replace(self, fit_workers=workers, auto_fit_workers=False,
+                       query_threads=self.query_threads or self.cpu_budget // workers)
+
     def record(self):
-        return dict(asdict(self), actual_query_threads=self.resolved_query_threads(),
-                    candidate_blas_threads=1 if self.fit_workers > 1 else "automatic", available_cpus=available_cpus())
+        fields = asdict(self)
+        if not self.cpu_budget:
+            for key in ("cpu_budget", "auto_fit_workers", "gpu_workers"):
+                fields.pop(key)
+        return dict(fields, actual_query_threads=self.resolved_query_threads(),
+                    candidate_blas_threads=1 if self.fit_workers > 1 or self.cpu_budget else "automatic",
+                    available_cpus=available_cpus())
 
     def argv(self):
         result = ["--" + name.replace("_", "-") for name in ("profile_fit",) if getattr(self, name)]
-        for name in ("fit_workers", "generator_workers", "query_threads", "fit_query_backend"):
+        for name in ("fit_workers", "generator_workers", "query_threads", "fit_query_backend",
+                     "collision_sampling", "collision_max_edge_m", "fit_objective", "penetration_weight"):
             result.extend(["--" + name.replace("_", "-"), str(getattr(self, name))])
+        if self.cpu_budget:
+            result.extend(["--cpu-budget", str(self.cpu_budget), "--gpu-workers", str(self.gpu_workers)])
+            if self.auto_fit_workers:
+                result.append("--auto-fit-workers")
         return result
 
 
@@ -71,7 +121,14 @@ def add_execution_arguments(parser):
     parser.add_argument("--fit-workers", type=int, default=1)
     parser.add_argument("--generator-workers", type=int, default=1)
     parser.add_argument("--query-threads", type=int, default=0)
-    parser.add_argument("--fit-query-backend", choices=["open3d", "warp"], default="open3d")
+    parser.add_argument("--fit-query-backend", choices=["open3d", "warp", "hybrid"], default="open3d")
+    parser.add_argument("--collision-sampling", choices=["legacy", "longest-edge"], default="legacy")
+    parser.add_argument("--collision-max-edge-m", type=float, default=.05)
+    parser.add_argument("--fit-objective", choices=["balanced", "collision-first"], default="collision-first")
+    parser.add_argument("--penetration-weight", type=float, default=1.0, help=argparse.SUPPRESS)
+    parser.add_argument("--cpu-budget", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--gpu-workers", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--auto-fit-workers", action="store_true", help=argparse.SUPPRESS)
 
 
 def peak_memory_bytes():

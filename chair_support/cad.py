@@ -27,7 +27,9 @@ ANNOTATIONS = {
 }
 
 
-def prepare_cad_assets(models_dir, destination):
+def prepare_cad_assets(models_dir, destination, category="chair"):
+    if category != "chair":
+        return prepare_seating_cad(models_dir, destination, category)
     models_dir, destination = Path(models_dir), Path(destination)
     chair_root = models_dir / "chair" if (models_dir / "chair").is_dir() else models_dir
     annotation_data=json.loads((Path(__file__).parent/"annotations"/"cad_chair_annotations_v1.json").read_text(encoding="utf-8"))
@@ -79,4 +81,66 @@ def prepare_cad_assets(models_dir, destination):
                 yaw_degrees=yaw,seat_height=seat_height,seat_height_band=band,
                 seat_faces=len(seat),backrest_faces=len(back),review_mesh="annotated.ply")))
         assets.append(out/"asset.json")
+    return assets
+
+
+def prepare_seating_cad(models_dir, destination, category):
+    """Apply reviewed, source-hash-bound functional predicates to original faces."""
+    if category not in ("sofa", "stool"):
+        raise ValueError("Unknown seating category: " + str(category))
+    models_dir, destination = Path(models_dir), Path(destination)
+    root = models_dir / category if (models_dir / category).is_dir() else models_dir
+    catalog = json.loads((Path(__file__).parent / "annotations/cad_seating_annotations_v1.json").read_text(encoding="utf-8"))
+    assets = []
+    for identity, annotation in sorted(catalog["assets"].items()):
+        if annotation["category"] != category:
+            continue
+        source = root / identity / "raw_model.obj"
+        out = destination / identity
+        record = dict(schema_version=2, id=identity, source="3D-FUTURE", category=category,
+                      heading_symmetry=annotation["heading_symmetry"], units="m", up_axis="Z", forward_axis="+Y")
+        if not source.is_file() or sha256(source) != annotation["source_sha256"]:
+            write_json(out / "asset.json", dict(record, annotation_error="Missing CAD source mesh or source hash mismatch"))
+            assets.append(out / "asset.json")
+            continue
+        mesh = trimesh.load(source, force="mesh", process=False)
+        vertices = np.column_stack((mesh.vertices[:,0], -mesh.vertices[:,2], mesh.vertices[:,1])) @ rotation(np.radians(annotation["yaw_degrees"])).T
+        vertices[:,2] -= vertices[:,2].min()
+        mesh = trimesh.Trimesh(vertices, mesh.faces, process=False)
+        centers, normals = mesh.triangles_center, mesh.face_normals
+        height, band = annotation["seat_height"], annotation["seat_height_band"]
+        seat = np.flatnonzero((normals[:,2] > .45) & (np.abs(centers[:,2] - height) < band))
+        if len(seat) < 3:
+            write_json(out / "asset.json", dict(record, annotation_error="CAD seat annotation is empty"))
+            assets.append(out / "asset.json")
+            continue
+        seat_vertices = np.unique(mesh.faces[seat])
+        center = np.median(vertices[seat_vertices], axis=0)
+        back = (np.flatnonzero((normals[:,1] > .20) & (centers[:,2] > height + .04) & (centers[:,1] < center[1]))
+                if category == "sofa" else np.empty(0, int))
+        back = np.setdiff1d(back, seat)
+        arms = (np.flatnonzero((centers[:,2] > height + .04) & (np.abs(centers[:,0]) > annotation["arm_inner_x"]))
+                if category == "sofa" else np.empty(0, int))
+        arms = np.setdiff1d(arms, np.r_[seat, back])
+        front_y = float(vertices[seat_vertices,1].max())
+        front_vertices = seat_vertices[vertices[seat_vertices,1] > front_y - .035]
+        front_faces = np.flatnonzero(np.isin(mesh.faces,front_vertices).any(axis=1) & (np.abs(centers[:,2]-height) < band+.02))
+        ids = np.full(len(mesh.faces), 2, np.int8)
+        ids[seat], ids[back], ids[arms] = 0, 1, 3
+        out.mkdir(parents=True, exist_ok=True)
+        mesh.export(out / "mesh.obj")
+        np.savez_compressed(out / "parts.npz", face_part_ids=ids, seat_face_indices=seat,
+            backrest_face_indices=back, armrest_face_indices=arms, front_edge_face_indices=front_faces,
+            front_edge_vertices=front_vertices, floor_vertices=np.flatnonzero(vertices[:,2] <= .005),
+            forward=np.array([0.,1.,0.]), forward_origin=center)
+        colors = np.array([[80,190,80,255],[80,130,240,255],[160,160,160,255],[235,165,70,255]],np.uint8)
+        mesh.visual.face_colors=colors[ids]
+        mesh.export(out / "annotated.ply")
+        write_json(out / "asset.json", dict(record, mesh="mesh.obj", parts="parts.npz",
+            source_mesh=str(source.resolve()), source_mesh_sha256=annotation["source_sha256"],
+            geometry_sha256=sha256(out / "mesh.obj"),
+            hashes={"mesh.obj":sha256(out / "mesh.obj"),"parts.npz":sha256(out / "parts.npz")},
+            annotation=dict(annotation, method="source-bound height/direction/face-normal functional predicates",
+                            review_mesh="annotated.ply", seat_faces=len(seat),backrest_faces=len(back),armrest_faces=len(arms))))
+        assets.append(out / "asset.json")
     return assets

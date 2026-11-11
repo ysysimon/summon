@@ -4,6 +4,7 @@ Thresholds are engineering acceptance defaults, not calibrated probabilities.
 All acceptance decisions and failures are exported, including rejected meshes.
 """
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import time
@@ -12,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 from scipy.ndimage import uniform_filter1d
-from scipy.optimize import minimize
+from scipy.optimize import OptimizeResult, minimize
 from scipy.spatial import cKDTree
 import trimesh
 
@@ -85,7 +86,7 @@ def contiguous_runs(mask):
     return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
 
 
-def motion_context(manifest_path, vertices_path, contacts_path, indices_path, output, visits=None, locations=None):
+def motion_context(manifest_path, vertices_path, contacts_path, indices_path, output, visits=None, locations=None, category=None):
     p = Path(manifest_path)
     manifest = json.loads(p.read_text(encoding="utf-8"))
     data = manifest.get("fitting_data", manifest)
@@ -118,11 +119,13 @@ def motion_context(manifest_path, vertices_path, contacts_path, indices_path, ou
     smooth = max(1, int(round(fps * .1)))
     velocity = (np.gradient(uniform_filter1d(pelvis, smooth, axis=0, mode="nearest"), axis=0) * fps
                 if len(pelvis) > 1 else np.zeros_like(pelvis))
-    chair_contacts = labels == 3
+    seat_labels = (3, 4, 7) if category is not None else (3,)
+    chair_contacts = np.isin(labels, seat_labels)
     if visits is not None:
         from .multi_fit import instance_contacts, visit_masks
         interaction_ids, support_ids = visit_masks(visits, len(dense))
-        chair_contacts = instance_contacts(world, labels, source_indices, interaction_ids, visits[0]["instance_id"], locations)
+        chair_contacts = instance_contacts(world, labels, source_indices, interaction_ids, visits[0]["instance_id"], locations,
+                                            seat_labels=(3, 4, 7) if category is not None else (3, 4))
     chair_count = chair_contacts.sum(axis=1)
     phase_count = np.interp(np.arange(len(dense)), source_indices, chair_count)
     conditions = {"insufficient_chair_contacts": phase_count >= DEFAULTS["min_chair_vertices"]}
@@ -150,7 +153,7 @@ def motion_context(manifest_path, vertices_path, contacts_path, indices_path, ou
     np.save(output / "pelvis.npy", pelvis.astype(np.float32))
     ctx = dict(dense=dense, joints=joints, joint_names=names, j=j, faces=faces, world=world,
                labels=labels, indices=source_indices, fps=fps, pelvis=pelvis, forward=forward,
-               right=right, floor=floor, frame_weights=weights)
+               right=right, floor=floor, frame_weights=weights, category=category or "chair", seating=category is not None)
     regions = body_regions(ctx)
     anchors, invalid = collect_support_samples(ctx, regions, np.flatnonzero(candidate))
     valid_frames = np.array([sample[0] for sample in anchors[REGIONS[0]]], dtype=int)
@@ -273,7 +276,9 @@ def prepare_support(ctx, regions, output):
     widths = [np.ptp((np.asarray(ctx["dense"][f])[anatomical_ids]-p)@right) for f in frames]
     # Statistical width uses evidence weights; the footprint must still contain
     # every selected support envelope, including low-weight source frames.
-    width = max(weighted_quantile(widths,frame_weights,.5),float(np.ptp(projected[:,0])))
+    width = weighted_quantile(widths,frame_weights,.5)
+    if ctx.get("category", "chair") != "chair":
+        width = max(width,float(np.ptp(projected[:,0])))
     dims = dict(seat_height=float(height), seat_width=float(width+.06),
                 seat_depth=float(np.ptp(projected[:,1])+.08))
     estimate = dict(dimensions=dims, pelvis=p.tolist(), forward=fwd.tolist(), floor_height=ctx["floor"],
@@ -283,6 +288,24 @@ def prepare_support(ctx, regions, output):
                     thresholds=DEFAULTS, support_frames=len(frames),
                     support_selection_version=SELECTION_VERSION,
                     support_seconds=ctx["phase"]["support_seconds"], warnings=ctx["phase"]["warnings"])
+    estimate["category"] = ctx.get("category", "chair")
+    if estimate["category"] != "chair":
+        # A sofa's whole footprint covers every selected visit. The person may
+        # occupy any local position; the whole-seat centre is not a body anchor.
+        center = p + right * (projected[:, 0].min() + projected[:, 0].max()) / 2
+        center += fwd * (projected[:, 1].min() + projected[:, 1].max()) / 2
+        estimate["initial_seat_center"] = center.tolist()
+        estimate["local_contact_centers"] = []
+        for visit in ctx.get("visits", []):
+            samples = [x[2] for r in REGIONS for x in anchors[r] if visit["start"] <= x[0] < visit["end"]]
+            # main already returns visit_support_unverified for a visit without
+            # selected evidence. Keep its position explicit for direct callers.
+            estimate["local_contact_centers"].append(
+                np.average(np.concatenate(samples), axis=0).tolist() if samples else None)
+        if estimate["category"] == "stool":
+            dims["seat_width"] = dims["seat_depth"] = max(dims["seat_width"], dims["seat_depth"])
+        write_json(output / "estimate.json", estimate)
+        return anchors, estimate
     proxy=estimate_seat_slope(anchors,np.asarray(estimate["initial_seat_center"]),fwd,ctx["floor"],dims["seat_depth"],ctx["fps"])
     estimate["seat_profile"]=proxy
     # Infinigen's front_dip offsets Bezier handles, not the evaluated surface:
@@ -367,7 +390,7 @@ def contact_roles(ctx, regions, output):
         if "instance_contacts" in ctx:
             ids=np.flatnonzero(ctx["instance_contacts"][row])
         else:
-            ids=np.flatnonzero(ctx["labels"][row]==3)
+            ids=np.flatnonzero(np.isin(ctx["labels"][row], (3, 4, 7) if ctx.get("seating") else (3,)))
         if not len(ids): continue
         v=np.asarray(ctx["dense"][frame]);normals=vertex_normals(v,ctx["faces"])
         points=np.asarray(ctx["world"][frame,ids]);_,nearest=cKDTree(v).query(points)
@@ -418,15 +441,22 @@ def read_asset(path):
             part[key] = part[alias]
     if "face_part_ids" in part:
         ids=np.asarray(part["face_part_ids"])
-        if ids.shape!=(len(mesh.faces),) or not np.issubdtype(ids.dtype,np.integer) or not np.isin(ids,[0,1,2]).all():
+        if ids.shape!=(len(mesh.faces),) or not np.issubdtype(ids.dtype,np.integer) or not np.isin(ids,[0,1,2,3]).all():
             raise ValueError("Invalid complete face_part_ids annotation")
         part.setdefault("seat_face_indices", np.flatnonzero(part["face_part_ids"] == 0))
         part.setdefault("backrest_face_indices", np.flatnonzero(part["face_part_ids"] == 1))
-    for key in (*aliases,"front_edge_face_indices","front_edge_vertices","floor_vertices"):
+        part.setdefault("armrest_face_indices", np.flatnonzero(part["face_part_ids"] == 3))
+    if "armrest_faces" in part:
+        part.setdefault("armrest_face_indices", part["armrest_faces"])
+    optional_back = a.get("category", "chair") == "stool"
+    if optional_back:
+        part.setdefault("backrest_face_indices", np.empty(0, dtype=int))
+    required = {"seat_face_indices"} | (set() if optional_back else {"backrest_face_indices"})
+    for key in (*aliases,"armrest_face_indices","front_edge_face_indices","front_edge_vertices","floor_vertices"):
         if key not in part and key not in aliases: continue
         ids = np.asarray(part.get(key, []))
         limit=len(mesh.vertices) if key.endswith("vertices") else len(mesh.faces)
-        if (ids.ndim!=1 or not np.issubdtype(ids.dtype,np.integer) or (key in aliases and not len(ids))
+        if (ids.ndim!=1 or not np.issubdtype(ids.dtype,np.integer) or (key in required and not len(ids))
                 or np.any(ids < 0) or np.any(ids >= limit) or len(np.unique(ids))!=len(ids)):
             raise UnverifiedSupport("Missing or invalid chair surface: " + key)
     for key,identity in (("seat_face_indices",0),("backrest_face_indices",1)):
@@ -434,6 +464,8 @@ def read_asset(path):
             raise ValueError("Functional surface conflicts with face_part_ids: "+key)
     for key,axis in (("seat_face_indices",2),("backrest_face_indices",1)):
         selected=np.asarray(part[key],int)
+        if not len(selected) and key not in required:
+            continue
         area=mesh.area_faces[selected]
         valid=mesh.face_normals[selected,axis]>.20
         if area[valid].sum()/max(area.sum(),1e-12)<.90:
@@ -489,10 +521,11 @@ def support_checks(metrics, policy=None):
     return failures
 
 
-def placement_checks(mesh, parts, pelvis, body_forward, chair_forward, floor):
+def placement_checks(mesh, parts, pelvis, body_forward, chair_forward, floor, heading_symmetry=None):
+    from .seating import heading_errors
     back_vertices=np.unique(mesh.faces[parts["backrest_face_indices"]])
-    posterior=np.array([((mesh.vertices[back_vertices]-p)@f).max() for p,f in zip(pelvis,body_forward)])
-    yaw_errors=np.degrees(np.arccos(np.clip(body_forward@chair_forward,-1.,1.)))
+    posterior=np.array([((mesh.vertices[back_vertices]-p)@f).max() for p,f in zip(pelvis,body_forward)]) if len(back_vertices) else None
+    yaw_errors=heading_errors(body_forward, chair_forward, heading_symmetry)
     floor_error=float(abs(mesh.vertices[:,2].min()-floor))
     reasons=[]
     # Temporarily skip the pelvis-half-space backrest check (2026-11-09).
@@ -500,7 +533,7 @@ def placement_checks(mesh, parts, pelvis, body_forward, chair_forward, floor):
     # if posterior.max()>=0: reasons.append("backrest_not_behind_pelvis")
     if yaw_errors.max()>DEFAULTS["maximum_yaw_degrees"]: reasons.append("chair_heading_mismatch")
     if floor_error>DEFAULTS["floor_tolerance"]: reasons.append("chair_not_grounded")
-    return dict(backrest_forward_offset_max=float(posterior.max()),yaw_error_degrees=float(yaw_errors.max()),
+    return dict(backrest_forward_offset_max=float(posterior.max()) if posterior is not None else None,yaw_error_degrees=float(yaw_errors.max()),
                 floor_error=floor_error),reasons
 
 
@@ -510,7 +543,11 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
     started = time.perf_counter()
     failure = None
     try:
-        with execution_scope(execution, profile):
+        blas = nullcontext()
+        if execution.cpu_budget and execution.fit_workers == 1:
+            from threadpoolctl import threadpool_limits
+            blas = threadpool_limits(limits=1, user_api="blas")
+        with execution_scope(execution, profile), blas:
             with profile.time("candidate_total"):
                 result = _fit_asset(path, ctx, anchors, estimate, output, contacts, profile)
     except BaseException as exc:
@@ -538,8 +575,17 @@ def fit_asset(path, ctx, anchors, estimate, output, contacts=None):
 
 def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
     policy = ctx.get("policy", FitPolicy())
+    from .collision_sampling import build_samples, summarize
+    from .query_backend import collision_scene
+    from .priority import choose as choose_priority, TOLERANCE_M, VERSION as priority_version
+    execution = ctx.get("_execution", ExecutionOptions())
+    priority = execution.fit_objective == "collision-first" and policy.penetration_optimization
+    penetration_weight = execution.penetration_weight if execution.fit_objective == "balanced" else 1.0
     with profile.time("asset_loading"):
         meta, mesh, parts = read_asset(path)
+    from .seating import heading_errors
+    symmetry = meta.get("heading_symmetry")
+    category = meta.get("category", "chair")
     asset_id = str(meta.get("id", meta.get("asset_id", Path(path).parent.name)))
     candidate_directory_key(asset_id)
     directory = output / "candidates" / asset_id
@@ -590,8 +636,9 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
         refresh_sample_weights()
         invalidate_objective()
         return True
-    contact_scenes={"seat":seat,"back":query_scene(mesh.vertices,mesh.faces[parts["backrest_face_indices"]]),
-                    "other":query_scene(mesh.vertices,mesh.faces)}
+    contact_scenes={"seat":seat,"other":query_scene(mesh.vertices,mesh.faces)}
+    if len(parts["backrest_face_indices"]):
+        contact_scenes["back"]=query_scene(mesh.vertices,mesh.faces[parts["backrest_face_indices"]])
     front=parts.get("front_edge_face_indices",[])
     if len(front): contact_scenes["front"]=query_scene(mesh.vertices,mesh.faces[front])
     back_vertices=np.unique(mesh.faces[parts["backrest_face_indices"]])
@@ -600,6 +647,11 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
     guard_weights = ctx["frame_weights"][guard_frames]
     pelvis_projection = np.sum(ctx["pelvis"][guard_frames]*guard_forward,axis=1)
     collision_guard_frames=list(dict.fromkeys(int(f) for f in guard_frames[[0,len(guard_frames)//2,-1]])) if policy.penetration_optimization else []
+    if priority:
+        # Contiguous support intervals include every return to the seat.
+        intervals=[np.asarray(visit["selected_source_frames"],int) for visit in ctx.get("phase",{}).get("visits",[])] or [guard_frames]
+        collision_guard_frames=sorted(set(int(f) for interval in intervals if len(interval)
+            for f in interval[[0,len(interval)//2,-1]]))
     # Fixed human scenes are shared across chair candidates. These sparse guard
     # samples guide optimization only; the final collision audit is independent.
     if policy.penetration_optimization and "_collision_proxy_faces" not in ctx:
@@ -608,7 +660,7 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
     def make_body_scene(frame):
         body=np.asarray(ctx["dense"][frame])
         capped=np.vstack([body]+[body[loop].mean(0)[None] for loop in ctx["_collision_proxy_loops"]])
-        return query_scene(capped,ctx["_collision_proxy_faces"])
+        return collision_scene(capped,ctx["_collision_proxy_faces"])
     def body_scene(frame):
         if frame not in body_scenes:
             body_scenes[frame]=make_body_scene(frame)
@@ -616,6 +668,10 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
     chair_guard_samples=np.vstack((mesh.vertices,mesh.triangles_center))
     _,sample_ids=np.unique(np.floor(chair_guard_samples/.02).astype(np.int64),axis=0,return_index=True)
     chair_guard_samples=chair_guard_samples[sample_ids]
+    with profile.time("collision_sampling"):
+        sampling=build_samples(mesh,parts,execution.collision_sampling,execution.collision_max_edge_m,scale_bounds[1])
+    sampling.save(directory/"collision-samples.npz")
+    chair_guard_samples=sampling.points
     cached_guard={"key":None,"minimum":None}
     guard_risk_scans=[]
     def transform(x):
@@ -626,6 +682,10 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
         key=(evaluations.epoch,tuple(np.asarray(x)),tuple(collision_guard_frames))
         if key!=cached_guard["key"]:
             r,t,scale=transform(x)
+            if priority or execution.collision_sampling != "legacy" or execution.fit_query_backend == "hybrid":
+                rows=[summarize(body_scene(frame),sampling,r,t,scale,execution.fit_query_backend=="hybrid") for frame in collision_guard_frames]
+                cached_guard.update(key=key,minimum=-np.array([row["depth"] for row in rows]),summaries=rows)
+                return cached_guard["minimum"]
             query=o3d.core.Tensor((chair_guard_samples@r.T*scale+t).astype(np.float32))
             def minimum(frame):
                 scene=body_scene(frame)
@@ -640,23 +700,28 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
         r,t,scale=transform(x)
         query=o3d.core.Tensor((chair_guard_samples@r.T*scale+t).astype(np.float32))
         minimum=np.empty(len(ctx["dense"]),float)
+        rms=np.empty(len(minimum),float)
         for frame in range(len(ctx["dense"])):
             scene=body_scenes.get(frame)
             if scene is None: scene=make_body_scene(frame)
-            distance=(scene.transformed_distance(chair_guard_samples,r,t,scale,inverse=False,signed=True)
-                      if hasattr(scene,"transformed_distance") else scene.compute_signed_distance(query))
-            minimum[frame]=float(distance.numpy().min())
+            summary=summarize(scene,sampling,r,t,scale,execution.fit_query_backend=="hybrid")
+            minimum[frame]=-summary["depth"]
+            rms[frame]=summary["rms"]
             # Only already active/selected scenes survive this streaming scan.
             del scene
-        selected=[int(frame) for frame in np.argsort(minimum) if frame not in collision_guard_frames][:3]
+        current=float(minimum[collision_guard_frames].min()) if collision_guard_frames else 0.
+        selected=[int(frame) for frame in np.argsort(minimum,kind="stable") if frame not in collision_guard_frames
+                  and (not priority or minimum[frame]<current-TOLERANCE_M)][:3]
         collision_guard_frames.extend(selected)
         for frame in selected: body_scene(frame)
         path=directory/("guard-risk-scan-%02d.npz"%len(guard_risk_scans))
-        np.savez_compressed(path,source_frame_indices=np.arange(len(minimum)),minimum_signed_distance=minimum)
+        np.savez_compressed(path,source_frame_indices=np.arange(len(minimum)),minimum_signed_distance=minimum,rms_penetration=rms)
         guard_risk_scans.append(dict(path=path.name,checked_source_frames=len(minimum),
+            pose=np.asarray(x).tolist(),
             sampled_chair_points=len(chair_guard_samples),selected_source_frames=selected,
             selected_minimum_signed_distances=[float(minimum[frame]) for frame in selected],
             global_minimum_signed_distance=float(minimum.min()),
+            full_motion_rms_m=float(np.sqrt(np.mean(rms*rms))),
             policy="streamed " + ctx.get("_execution", ExecutionOptions()).fit_query_backend + " guard SDF; optimization guidance only, not final certification"))
         cached_guard["key"]=None
         return selected
@@ -716,27 +781,73 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
                     local=(p-t)@r/scale
                     d=sc.compute_distance(o3d.core.Tensor(local.astype(np.float32))).numpy()*scale
                 components["contact"]+=.10*float(np.average(np.minimum(d,.15)**2,weights=weights))
-        back_world=mesh.vertices[back_vertices]@r.T*scale+t
-        offsets=(back_world@guard_forward.T).max(axis=0)-pelvis_projection
-        components["placement"]+=100*float(np.average(np.maximum(offsets,0)**2,weights=guard_weights))
+        if len(back_vertices):
+            back_world=mesh.vertices[back_vertices]@r.T*scale+t
+            offsets=(back_world@guard_forward.T).max(axis=0)-pelvis_projection
+            components["placement"]+=100*float(np.average(np.maximum(offsets,0)**2,weights=guard_weights))
         if policy.penetration_optimization:
             components["penetration"]+=100*float(np.mean(np.maximum(-guard_minimum_distances(x)-policy.max_penetration_m,0)**2))
-        components["regularization"] = .001*(scale-1)**2 + .001*(x[2]-desired_yaw)**2
+        angular = np.radians(heading_errors(np.array([[0.,1.,0.]]) @ rotation(desired_yaw).T,
+                                           np.array([0.,1.,0.]) @ r.T, symmetry)[0]) if symmetry else x[2]-desired_yaw
+        components["regularization"] = .001*(scale-1)**2 + .001*angular**2
+        components["penetration"] *= penetration_weight
         last_components.update(components)
         return sum(components.values())
+    def priority_score(x):
+        def compute():
+            cost(x)
+            components=dict(last_components)
+            depths=-guard_minimum_distances(x)
+            depth=float(max(0.,depths.max())) if len(depths) else 0.
+            rows=cached_guard.get("summaries",[])
+            rms=float(np.sqrt(np.average([row["rms"]**2 for row in rows],
+                weights=[max(1e-12,float(ctx["frame_weights"][f])) for f in collision_guard_frames]))) if rows else 0.
+            for region in points:
+                gaps,valid=cached_support(x,region)
+                if valid.any():
+                    p=np.maximum(-gaps[valid],0.)
+                    w=np.concatenate([sample[3] for sample in optimized_samples[region]])[valid]
+                    depth=max(depth,float(p.max()))
+                    rms=max(rms,float(np.sqrt(np.average(p*p,weights=w))))
+            return (depth,rms,components["support"],components["contact"]+components["placement"]+components["regularization"])
+        return evaluations.get(x,"priority",compute)
+    def search_cost(x):
+        return priority_score(x)[0] if priority else cost(x)
     bounds=[(t0[0]-.25,t0[0]+.25),(t0[1]-.25,t0[1]+.25),
             (desired_yaw-np.radians(20),desired_yaw+np.radians(20)),scale_bounds]
     x0=np.array([t0[0],t0[1],desired_yaw,scale0])
     starts=[]
-    for dx in (-.08,0.,.08):
-        for dy in (-.08,0.,.08):
+    dxs = dys = (-.08, 0., .08)
+    if category == "sofa":
+        # Search local contact positions across the actual wide seat, including
+        # its ends. These are optimizer bounds, never acceptance cutoffs.
+        reach = (seat_hi-seat_lo) * scale_bounds[1] / 2 + .25
+        extent = np.abs(r0[:2,:2]) @ reach
+        bounds[0]=(t0[0]-extent[0],t0[0]+extent[0])
+        bounds[1]=(t0[1]-extent[1],t0[1]+extent[1])
+        offsets=[np.zeros(2)]
+        for q in np.linspace(.1,.9,5):
+            local=seat_center.copy();local[0]=seat_lo[0]+q*(seat_hi[0]-seat_lo[0])
+            offsets.append(((seat_center-local)@r0.T)[:2]*scale0)
+        dxs=sorted(set([-.08,0.,.08]+[float(o[0]) for o in offsets]))
+        dys=sorted(set([-.08,0.,.08]+[float(o[1]) for o in offsets]))
+    for dx in dxs:
+        for dy in dys:
             for da in (-15.,0.,15.):
                 for s in sorted(set([float(scale0),*scale_bounds])):
                     x=np.array([t0[0]+dx,t0[1]+dy,desired_yaw+np.radians(da),s])
-                    starts.append((cost(x),x))
+                    starts.append((priority_score(x) if priority else cost(x),x))
     best_starts=sorted(starts,key=lambda x:x[0])[:3]
+    if ctx.get("_fixed_starts") is not None:
+        best_starts=[(cost(np.asarray(x)),np.asarray(x,dtype=float)) for x in ctx["_fixed_starts"]]
     with profile.time("powell"):
-        results=[minimize(cost,x,method="Powell",bounds=bounds,options={"maxiter":70,"xtol":1e-4,"ftol":1e-5}) for _,x in best_starts]
+        print("Optimizing",asset_id,"initials",len(best_starts),"collision frames",len(collision_guard_frames),flush=True)
+        results=[minimize(search_cost,x,method="Powell",bounds=bounds,options={"maxiter":70,"xtol":1e-4,"ftol":1e-5}) for _,x in best_starts]
+    if category == "sofa" or priority:
+        # Powell can cross broad equal-cost regions and leave a useful end-seat
+        # placement. Keep the evaluated local starts in the same ranking pool.
+        results.extend(OptimizeResult(x=x.copy(),fun=cost(x),success=False,
+                       message="retained local seating initialization",nfev=1) for value,x in best_starts)
     all_lower=np.array([bound[0] for bound in bounds]);all_upper=np.array([bound[1] for bound in bounds])
     for result in results:
         result.raw_bounds_violation=float(max(0.,(all_lower-result.x).max(),(result.x-all_upper).max()))
@@ -771,11 +882,12 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
                 else:
                     if policy.support_optimization: residuals.append(-.1)
                     if policy.penetration_optimization: residuals.append(-.1 if policy.support_optimization else policy.max_penetration_m)
-        back_world=mesh.vertices[back_vertices]@r.T*scale+t
-        offsets=(back_world@guard_forward.T).max(axis=0)-pelvis_projection
-        residuals.append(-float(offsets.max())-margin)
+        if len(back_vertices):
+            back_world=mesh.vertices[back_vertices]@r.T*scale+t
+            offsets=(back_world@guard_forward.T).max(axis=0)-pelvis_projection
+            residuals.append(-float(offsets.max())-margin)
         heading=np.array([0.,1.,0.])@r.T
-        angles=np.degrees(np.arccos(np.clip(ctx["forward"][guard_frames]@heading,-1.,1.)))
+        angles=heading_errors(ctx["forward"][guard_frames],heading,symmetry)
         residuals.append(.01*(DEFAULTS["maximum_yaw_degrees"]-float(angles.max())))
         # A certificate needs room for outside-witness and surface-cell bounds.
         # Support can approach its exact threshold more tightly than this.
@@ -786,35 +898,64 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
     active=np.array([i for i,(lo,hi) in enumerate(bounds) if hi>lo],int)
     lower_bounds=np.array([bounds[i][0] for i in active])
     upper_bounds=np.array([bounds[i][1] for i in active])
-    def repair(start):
+    def repair(start, budget=None, restoration=False):
         fixed=start.x.copy()
+        anchor=priority_score(fixed) if priority else None
         def expand(x):
             result=fixed.copy();result[active]=x;return result
         with profile.time("cobyla_repair"):
-            repaired=minimize(lambda x:cost(expand(x)),start.x[active],method="COBYLA",
-                constraints=[{"type":"ineq","fun":lambda x:feasible_residuals(expand(x))},
+            repaired=minimize(lambda x:search_cost(expand(x)) if restoration else (priority_score(expand(x))[2] if priority else cost(expand(x))),start.x[active],method="COBYLA",
+                constraints=[{"type":"ineq","fun":lambda x:np.ones(1) if restoration else (np.asarray(anchor[:2])+TOLERANCE_M-np.asarray(priority_score(expand(x))[:2]) if priority else feasible_residuals(expand(x)))},
                     {"type":"ineq","fun":lambda x:x-lower_bounds},
                     {"type":"ineq","fun":lambda x:upper_bounds-x}],
-                options={"maxiter":300 if buffer_tier==0 else 900,
+                options={"maxiter":budget if budget is not None else (300 if buffer_tier==0 else 900),
                     "rhobeg":.02 if buffer_tier==0 else .005,
                     "tol":1e-5 if buffer_tier==0 else 1e-6,"catol":1e-7})
         raw=expand(repaired.x)
         repaired.raw_bounds_violation=float(max(0.,(all_lower-raw).max(),(raw-all_upper).max()))
         repaired.x=np.clip(raw,all_lower,all_upper)
+        repaired.collision_anchor=anchor[:2] if priority and not restoration else None
         repaired.fun=cost(repaired.x);repairs.append(repaired)
         return repaired
     repairs=[]
-    for start in sorted(results,key=lambda o:(violation(o.x),o.fun))[:2]:
+    for start in sorted(results,key=lambda o:priority_score(o.x) if priority else (violation(o.x),o.fun))[:2]:
         repaired=repair(start)
-        if violation(repaired.x)<=1e-6: break
+        if not priority and violation(repaired.x)<=1e-6: break
     choices=results+repairs
     def choose_result():
-        return choose_current_result(choices,cost,violation)
+        return choose_priority(choices,priority_score) if priority else choose_current_result(choices,cost,violation)
     opt=choose_result()
     validation_rounds=[];collision_witnesses=[]
     support_repairs=0;collision_repairs=0
     maximum_validation_rounds=8
     maximum_support_repairs=6;maximum_collision_repairs=6
+    if priority:
+        # Risk refinement is optimization work even when strict acceptance is off.
+        for risk_round in range(maximum_collision_repairs+1):
+            print("Collision risk scan",asset_id,risk_round,flush=True)
+            with profile.time("full_motion_guard_scan"):
+                added=scan_full_motion_guard_risk(opt.x)
+            invalidate_objective()
+            opt=choose_result()
+            if not added or risk_round==maximum_collision_repairs: break
+            # Share the existing 300-evaluation repair allowance between stages.
+            restored=repair(opt,budget=150,restoration=True)
+            choices.append(restored);opt=choose_result()
+            choices.append(repair(opt,budget=150));opt=choose_result();collision_repairs+=1
+        # Active-set progress is not necessarily progress on unobserved frames.
+        # Compare all fully scanned poses before exporting/validating a winner.
+        with profile.time("full_motion_guard_scan"):
+            scan_full_motion_guard_risk(opt.x)
+        invalidate_objective()
+        scanned={tuple(row["pose"]):row for row in guard_risk_scans}
+        scanned_choices=[OptimizeResult(x=np.asarray(pose),fun=cost(np.asarray(pose)),success=False,
+            message="retained complete-motion scan") for pose in scanned]
+        def full_score(x):
+            row=scanned[tuple(x)]; score=priority_score(x)
+            return (max(score[0],-row["global_minimum_signed_distance"]),
+                max(score[1],row["full_motion_rms_m"]),*score[2:])
+        opt=choose_priority(scanned_choices,full_score)
+        choices.extend(scanned_choices)
     for validation_round in range(maximum_validation_rounds):
         r,t,scale=transform(opt.x)
         fitted=trimesh.Trimesh(mesh.vertices @ r.T * scale+t,mesh.faces,process=False)
@@ -833,7 +974,7 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
             worst_support[region]=[dict(frame=f,**m) for f,m in per_frame]
         reasons=support_checks(support,policy) if support else []
         placement,placement_reasons=placement_checks(fitted,parts,ctx["pelvis"][ctx["support_frames"]],
-            ctx["forward"][ctx["support_frames"]],np.array([0.,1.,0.])@r.T,ctx["floor"])
+            ctx["forward"][ctx["support_frames"]],np.array([0.,1.,0.])@r.T,ctx["floor"],symmetry)
         reasons.extend(placement_reasons)
         metrics=dict(support=support,scale=float(scale),geometry=geometry.summary() if geometry is not None else skipped(),**placement)
         if "visits" in ctx:
@@ -908,6 +1049,9 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
                 local=(np.asarray(witness["point"])-t)@r/scale
                 if np.linalg.norm(chair_guard_samples-local,axis=1).min()>1e-6:
                     chair_guard_samples=np.vstack((chair_guard_samples,local))
+                    sampling.points=np.asarray(chair_guard_samples,dtype=np.float32)
+                    sampling.weights=np.r_[sampling.weights,0.]
+                    sampling.token=hashlib.sha256(sampling.points.tobytes()).hexdigest()
                     collision_witnesses.append(dict(source_frame=int(collision_repair_frame),
                         source_face=witness.get("source_face"),source_part=witness.get("source_part"),
                         local_point=local.tolist(),world_point_at_discovery=witness["point"],
@@ -940,7 +1084,17 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
     profile.count("optimization_cache_misses",evaluations.misses)
     profile.count("collision_cache_hits",certificates.hits)
     profile.count("optimizer_function_evaluations",sum(int(getattr(o,"nfev",0)) for o in choices))
-    write_json(directory/"optimization.json",dict(execution=ctx.get("_execution",ExecutionOptions()).record(),objective_epoch=evaluations.epoch,collision_cache_hits=certificates.hits,method="coarse grid, Powell, COBYLA feasibility repair",
+    if priority:
+        with profile.time("full_motion_guard_scan"):
+            scan_full_motion_guard_risk(opt.x)
+        invalidate_objective()
+    final_priority=list(priority_score(opt.x)) if priority else None
+    if priority:
+        final_priority[0]=max(final_priority[0],-guard_risk_scans[-1]["global_minimum_signed_distance"])
+        final_priority[1]=max(final_priority[1],guard_risk_scans[-1]["full_motion_rms_m"])
+    write_json(directory/"optimization.json",dict(execution=ctx.get("_execution",ExecutionOptions()).record(),objective_epoch=evaluations.epoch,collision_cache_hits=certificates.hits,method="collision restoration then collision-preserving support" if priority else "coarse grid, Powell, COBYLA feasibility repair",
+        initial_starts=[x.tolist() for _,x in best_starts],priority_version=priority_version if priority else None,
+        priority_score=final_priority,collision_preservation_tolerance_m=TOLERANCE_M if priority else None,
         internal_margin_m=margin,initial_internal_margin_m=buffer_levels[0],buffer_history=buffer_history,
         collision_internal_margin_m=max(margin,.0001),minimum_collision_internal_margin_m=.0001,
         optimized_source_frames=[int(x[0]) for x in optimized_samples[REGIONS[0]]],
@@ -949,14 +1103,20 @@ def _fit_asset(path, ctx, anchors, estimate, output, contacts, profile):
         maximum_collision_repairs=maximum_collision_repairs,support_repairs=support_repairs,collision_repairs=collision_repairs,
         collision_witnesses=collision_witnesses,guard_risk_scans=guard_risk_scans,validation_rounds=validation_rounds,
         final_maximum_constraint_violation_m=violation(opt.x),
-        trials=[dict(loss=float(o.fun),constraint_violation_m=violation(o.x),success=bool(o.success),
+        trials=[dict(loss=float(cost(o.x)),constraint_violation_m=violation(o.x),success=bool(o.success),
+            priority_score=list(priority_score(o.x)) if priority else None,
+            collision_anchor=getattr(o,"collision_anchor",None),
             raw_bounds_violation=float(getattr(o,"raw_bounds_violation",0)),message=str(o.message)) for o in choices]))
     final_loss=float(cost(opt.x))
-    result=dict(policy=policy.record(),selection_eligible=not reasons,validation_status="complete" if policy.strict else "diagnostic_unverified",loss_components=dict(last_components),id=asset_id,mesh=str(mesh_path.relative_to(output)),parts=str((directory/"parts.npz").relative_to(output)),
+    result=dict(category=category,heading_symmetry=symmetry or {"type":"none"},policy=policy.record(),selection_eligible=not reasons,validation_status="complete" if policy.strict else "diagnostic_unverified",loss_components=dict(last_components),id=asset_id,mesh=str(mesh_path.relative_to(output)),parts=str((directory/"parts.npz").relative_to(output)),
                 qualified=not reasons and policy.strict,loss=final_loss,metrics=metrics,rejection_reasons=reasons,
                 worst_collision_frame=worst_frame,source_asset=str(Path(path).resolve()),
                 transform=dict(rotation=r.tolist(),translation=t.tolist(),scale=float(scale)),
                 geometry_audit=str(geometry_path.relative_to(output)) if geometry is not None else None, source_geometry_sha256=source_hash)
+    if priority:
+        result.update(priority_score=final_priority,priority_version=priority_version,
+                      optimization_collision=dict(worst_full_motion_depth_m=-guard_risk_scans[-1]["global_minimum_signed_distance"],
+                          checked_source_frames=len(ctx["dense"]),refinement_budget_exhausted=bool(guard_risk_scans[-1]["selected_source_frames"])))
     write_json(directory/"result.json",result)
     return result
 
@@ -1003,6 +1163,8 @@ def main(argv=None):
     parser.add_argument("--frame-indices",required=True,type=Path)
     parser.add_argument("--models-dir",type=Path)
     parser.add_argument("--candidate-source",choices=["cad","infinigen"],default="cad")
+    parser.add_argument("--category",choices=["chair","sofa","stool"],default=None,
+                        help="Enable category-aware seating evidence; omission preserves legacy chair fitting")
     parser.add_argument("--assets-manifest",type=Path)
     parser.add_argument("--instance-visits",type=Path,help="This instance's inferred visits on the complete source grid")
     parser.add_argument("--candidate-cache",type=Path,help="Reusable completed multi-instance candidate checkpoints")
@@ -1024,13 +1186,19 @@ def main(argv=None):
                 thresholds=dict(DEFAULTS,coverage=policy.support_min_coverage,gluteus_gap=policy.support_gluteus_gap_m,
                     thigh_gap=policy.support_thigh_gap_m,maximum_penetration=policy.max_penetration_m),validation_scope="geometry; no dynamics simulation",
                 prediction_sha256=sha256(args.contacts),world_sha256=sha256(args.vertices_path))
+    if execution.cpu_budget:
+        report["fit_resources"] = {"status": "skipped", "candidate_workers": 0}
     implementation_files=[Path(__file__),Path(__file__).parent/"cad.py",Path(__file__).parent/"annotations"/"body_regions_smplx_v1.json",
         Path(__file__).parent/"annotations"/"cad_chair_annotations_v1.json",Path(__file__).parent/"collision.py",
         Path(__file__).parent/"policy.py",Path(__file__).parent/"selection.py",Path(__file__).parent/"geometry_audit.py"]
-    implementation_files += [Path(__file__).with_name(name) for name in ("runtime.py","query_backend.py","warp_backend.py","solver_helpers.py","candidate_pool.py")]
+    implementation_files += [Path(__file__).with_name(name) for name in ("runtime.py","query_backend.py","warp_backend.py","solver_helpers.py","candidate_pool.py","collision_sampling.py","priority.py")]
+    implementation_files += [Path(__file__).with_name("seating.py"),Path(__file__).parent/"annotations"/"cad_seating_annotations_v1.json"]
     report["implementation_sha256"]={str(path.relative_to(Path(__file__).parent)):sha256(path) for path in implementation_files if path.is_file()}
     try:
         assignment=json.loads(args.instance_visits.read_text(encoding="utf-8")) if args.instance_visits else None
+        category=args.category or (assignment.get("category") if assignment else None)
+        if category is not None:
+            report.update(backend="supported-seating-v1",category=category)
         visits=assignment["events"] if assignment is not None else None
         cache=None
         if assignment is not None:
@@ -1045,7 +1213,7 @@ def main(argv=None):
             raise ValueError("--candidate-cache requires an instance visit assignment")
         with profile.time("motion_context"):
             ctx=motion_context(args.geometry,args.vertices_path,args.contacts,args.frame_indices,output,
-                               visits=visits,locations=assignment.get("locations") if assignment else None)
+                               visits=visits,locations=assignment.get("locations") if assignment else None,category=category)
         ctx["policy"]=policy
         ctx["_execution"]=execution
         report["support_selection"]={key:value for key,value in ctx["phase"].items()
@@ -1066,7 +1234,7 @@ def main(argv=None):
             assets=[resolve(args.assets_manifest.parent,p) for p in a["assets"]]
         elif args.candidate_source=="cad" and args.models_dir:
             from .cad import prepare_cad_assets
-            assets=prepare_cad_assets(args.models_dir,output/"cad_assets")
+            assets=prepare_cad_assets(args.models_dir,output/"cad_assets",category=category or "chair")
         else:
             raise ValueError("Provide --assets-manifest or --models-dir for CAD candidates")
         with profile.time("contact_roles"):
@@ -1077,9 +1245,10 @@ def main(argv=None):
             fd=manifest.get("fitting_data",manifest)
             inputs={key:sha256(resolve(args.geometry.parent,fd[key])) for key in ("world","joints","joint_names","faces")}
             inputs.update(manifest=sha256(args.geometry),low=report["world_sha256"],contacts=report["prediction_sha256"],
-                          frame_map=sha256(args.frame_indices),instance=assignment["instance_id"])
+                          frame_map=sha256(args.frame_indices),instance=assignment["instance_id"],
+                          category=ctx.get("category","chair"),seating=ctx.get("seating",False))
             runtime={name:importlib.metadata.version(name) for name in ("numpy","scipy","open3d","trimesh")}
-            if execution.fit_query_backend == "warp":
+            if execution.fit_query_backend in ("warp", "hybrid"):
                 runtime["warp-lang"]=importlib.metadata.version("warp-lang")
             cache=CandidateCache(args.candidate_cache,inputs,[platform.platform(),platform.python_version(),
                 runtime,report["implementation_sha256"],policy.record(),execution.record()],assignment,ctx["phase"])
@@ -1106,6 +1275,17 @@ def main(argv=None):
                     report["cache_hits"].append(record["id"])
             entries.append((path,record,checkpoint))
         pending=[path for path,record,_ in entries if record is None]
+        if execution.cpu_budget and pending:
+            execution = execution.for_candidates(len(pending))
+            ctx["_execution"] = execution
+            report["execution"] = execution.record()
+            report["fit_resources"] = {
+                "status": "running",
+                "candidate_workers": execution.fit_workers,
+                "cpu_query_threads_per_worker": execution.resolved_query_threads(),
+                "blas_threads_per_worker": 1,
+                "gpu_workers": execution.fit_workers if execution.fit_query_backend in ("hybrid", "warp") else 0,
+            }
         outcomes=None
         if execution.fit_workers > 1 and pending:
             # Context has not constructed any query scenes yet. Dense/low-res
@@ -1126,7 +1306,10 @@ def main(argv=None):
         finally:
             if outcomes is not None:
                 outcomes.close()
-        qualified=sorted((c for c in report["candidates"] if eligible(c)),key=lambda c:c["loss"])
+        if execution.cpu_budget and pending:
+            report["fit_resources"]["status"] = "completed"
+        from .priority import candidate_key
+        qualified=sorted((c for c in report["candidates"] if eligible(c)),key=candidate_key)
         for index,c in enumerate(qualified):
             c["retained"]=index<max(1,args.max_candidates)
         if qualified:
@@ -1139,6 +1322,8 @@ def main(argv=None):
     except Exception as exc:
         report["status"]="error"
         report["error"]=str(exc)
+        if report.get("fit_resources", {}).get("status") == "running":
+            report["fit_resources"]["status"] = "error"
         write_json(output/"fit_result.json",report)
         raise
     finally:

@@ -7,6 +7,7 @@ from .runtime import current_options, current_profile
 class CPUScene:
     def __init__(self, vertices, faces, threads=0, profile=None):
         self.threads, self.profile = threads, profile
+        self.bounds = np.stack((np.min(vertices,axis=0),np.max(vertices,axis=0)))
         self.scene = o3d.t.geometry.RaycastingScene(nthreads=1)
         self.scene.add_triangles(o3d.core.Tensor(np.asarray(vertices, np.float32)),
                                  o3d.core.Tensor(np.asarray(faces, np.uint32)))
@@ -23,8 +24,8 @@ class CPUScene:
     def compute_distance(self, points):
         return self._query("compute_distance", points)
 
-    def compute_signed_distance(self, points):
-        return self._query("compute_signed_distance", points)
+    def compute_signed_distance(self, points, nsamples=1):
+        return self._query("compute_signed_distance", points, nsamples=nsamples)
 
     def compute_closest_points(self, points):
         return self._query("compute_closest_points", points)
@@ -43,7 +44,7 @@ def cpu_scene(vertices, faces, execution=None, profile=None):
 
 def query_scene(vertices, faces, execution=None, profile=None):
     execution = execution or current_options()
-    if execution.fit_query_backend == "open3d":
+    if execution.fit_query_backend in ("open3d", "hybrid"):
         return cpu_scene(vertices, faces, execution, profile)
     try:
         from .warp_backend import WarpScene
@@ -53,3 +54,12 @@ def query_scene(vertices, faces, execution=None, profile=None):
         return WarpScene(vertices, faces, profile=profile)
     except Exception as exc:
         raise RuntimeError("Explicit Warp backend initialization failed") from exc
+
+
+def collision_scene(vertices, faces, execution=None, profile=None):
+    """Only optimization collision queries use CUDA in the hybrid backend."""
+    execution = execution or current_options()
+    if execution.fit_query_backend == "hybrid":
+        from .warp_backend import WarpScene
+        return WarpScene(vertices, faces, profile=profile)
+    return query_scene(vertices, faces, execution, profile)

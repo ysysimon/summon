@@ -11,6 +11,9 @@ import data_utils as du
 # python predict_contact.py ../data/amass --load_model ../training/contactformer/model_ckpt/best_model_recon_acc.pt --output_dir ../results/amass
 
 if __name__ == '__main__':
+    if threads := os.environ.get("YSYNTHETIC_TORCH_THREADS"):
+        torch.set_num_threads(int(threads))
+        torch.set_num_interop_threads(1)
     parser = argparse.ArgumentParser(description="")
     parser.add_argument("data_dir", type=str,
                         help="path to POSA_temp dataset dir")

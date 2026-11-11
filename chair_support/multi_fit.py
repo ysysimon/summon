@@ -36,18 +36,18 @@ def visit_masks(visits, nframes):
     return interaction, support
 
 
-def instance_contacts(world, labels, indices, interaction_ids, identity, locations):
+def instance_contacts(world, labels, indices, interaction_ids, identity, locations, seat_labels=(3, 4)):
     """Assign each observed seat-class vertex only within its visit and its location's footprint.
 
     A hand can reach the idle neighboring chair. At a Voronoi boundary its
     owner is unresolved and neither chair may use it as a fitting target.
     """
-    contact = np.isin(labels, [3, 4]) & (interaction_ids[indices, None] >= 0)
+    contact = np.isin(labels, seat_labels) & (interaction_ids[indices, None] >= 0)
     if locations is None:
         return contact
-    own = np.asarray(locations[identity], float)
-    others = [np.asarray(xy, float) for key, xy in locations.items() if key != identity]
-    if any(a.shape != (2,) or not np.isfinite(a).all() for a in [own] + others):
+    own = np.atleast_2d(np.asarray(locations[identity], float))
+    others = [np.atleast_2d(np.asarray(xy, float)) for key, xy in locations.items() if key != identity]
+    if any(a.ndim != 2 or a.shape[1] != 2 or not len(a) or not np.isfinite(a).all() for a in [own] + others):
         raise ValueError("Invalid inferred seat anchor")
     if not others:
         return contact
@@ -56,8 +56,8 @@ def instance_contacts(world, labels, indices, interaction_ids, identity, locatio
         if not len(vertices):
             continue
         xy = world[frame, vertices, :2]
-        distance = np.linalg.norm(xy - own, axis=1)
-        nearest_other = np.min([np.linalg.norm(xy - other, axis=1) for other in others], axis=0)
+        distance = np.linalg.norm(xy[:, None] - own[None], axis=2).min(axis=1)
+        nearest_other = np.linalg.norm(xy[:, None] - np.concatenate(others)[None], axis=2).min(axis=1)
         # 2 cm matches the support sampling grid. Do not resolve sub-cell ties.
         contact[row, vertices] = distance + .02 < nearest_other
     return contact

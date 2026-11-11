@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "method": "Original face predicates; Y-up to Z-up, canonical +Y opening. Heights bound to source hashes.",
+  "assets": {
+    "0a1e2fb3-3345-4483-a6ae-049923d15934": {
+      "category": "sofa",
+      "source_sha256": "ec59e99f353d3b5735e19240eca06f81336ac9e368834486c7f9c762c737d44e",
+      "yaw_degrees": 180,
+      "seat_height": 0.39,
+      "seat_height_band": 0.035,
+      "arm_inner_x": 1.04,
+      "heading_symmetry": {
+        "type": "none"
+      }
+    },
+    "0a237bbe-d40d-4689-8747-d4fc2afa6da0": {
+      "category": "sofa",
+      "source_sha256": "24bcab2d2431108988968609f2e2674ce4a060977e352777d13370815bc11707",
+      "yaw_degrees": 180,
+      "seat_height": 0.43,
+      "seat_height_band": 0.055,
+      "arm_inner_x": 1.03,
+      "heading_symmetry": {
+        "type": "none"
+      }
+    },
+    "0a52cf6f-5039-4606-bf33-cb9057f26fb9": {
+      "category": "sofa",
+      "source_sha256": "312079194478b71f84aae6fbd8cf5ae3f7169bf997a3a910f4bf0d08dbd1b66b",
+      "yaw_degrees": 180,
+      "seat_height": 0.39,
+      "seat_height_band": 0.035,
+      "arm_inner_x": 0.87,
+      "heading_symmetry": {
+        "type": "none"
+      }
+    },
+    "65813ee1-0f14-4102-bb7c-c723453e22cf": {
+      "category": "sofa",
+      "source_sha256": "12779f212612c8fbd688b789ca93bef1ab200f857605e21ef82599a772a1b191",
+      "yaw_degrees": 180,
+      "seat_height": 0.53,
+      "seat_height_band": 0.065,
+      "arm_inner_x": 1.32,
+      "heading_symmetry": {
+        "type": "none"
+      }
+    },
+    "69a7bb82-8f4c-4bb5-9184-d174731f8c0a": {
+      "category": "sofa",
+      "source_sha256": "c3426c0f93f75a3d994829f7fbd84b175887b8922e0da9f235855fbf663ed983",
+      "yaw_degrees": 180,
+      "seat_height": 0.45,
+      "seat_height_band": 0.055,
+      "arm_inner_x": 1.04,
+      "heading_symmetry": {
+        "type": "none"
+      }
+    },
+    "93e24762-4c57-4923-b6c0-3de0d1661ca9": {
+      "category": "sofa",
+      "source_sha256": "07dfe5e9ac37a006dd26ddc4cc85515cb49df310048c6837b7f8417765168c37",
+      "yaw_degrees": 180,
+      "seat_height": 0.37,
+      "seat_height_band": 0.035,
+      "arm_inner_x": 0.9,
+      "heading_symmetry": {
+        "type": "none"
+      }
+    },
+    "6d63e63e-9915-4935-b8c8-0fe06dc81acb": {
+      "category": "stool",
+      "source_sha256": "4d3896f35879a4d90dfc7e972ce11781b3cbb3b9c465a4fc2dab53d80167dd19",
+      "yaw_degrees": 0,
+      "seat_height": 0.38,
+      "seat_height_band": 0.055,
+      "heading_symmetry": {
+        "type": "discrete",
+        "order": 2
+      }
+    },
+    "6da3e5b6-8cc9-4c22-a930-cbfc5429a98f": {
+      "category": "stool",
+      "source_sha256": "f6eaebeffa0413c7733dd939287ada65bec0255cc8ce896973ca047813a9493b",
+      "yaw_degrees": 0,
+      "seat_height": 0.76,
+      "seat_height_band": 0.025,
+      "heading_symmetry": {
+        "type": "continuous"
+      }
+    },
+    "6f58d5e3-0923-4ffe-b8e2-b20906604209": {
+      "category": "stool",
+      "source_sha256": "4619dd7c3e3fcddaba7ee1d147e94e0ddd264bc8b1cccabfbf94285006cbe601",
+      "yaw_degrees": 0,
+      "seat_height": 0.385,
+      "seat_height_band": 0.055,
+      "heading_symmetry": {
+        "type": "discrete",
+        "order": 2
+      }
+    }
+  }
+}

@@ -469,12 +469,15 @@ def reused_certificate(candidates, count):
     )
 
 
-def ranked_choices(ordered):
-    """Visit the Cartesian product lazily in ascending summed loss, with deterministic ties."""
+def ranked_choices(ordered, weights=None):
+    """Visit the product by loss; optional sample weights preserve seating ranking."""
+    weights = [1.] * len(ordered) if weights is None else list(weights)
+    if len(weights) != len(ordered) or any(not math.isfinite(w) or w <= 0 for w in weights):
+        raise ValueError("Scene ranking weights must be positive, finite and match instances")
     start = (0,) * len(ordered)
 
     def cost(indices):
-        return math.fsum(rows[i]["loss"] for rows, i in zip(ordered, indices))
+        return math.fsum(w * rows[i]["loss"] for w, rows, i in zip(weights, ordered, indices))
 
     queue, seen = [(cost(start), start)], {start}
     while queue:
@@ -518,7 +521,8 @@ def has_measured_rejection(reasons):
     return False
 
 
-def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, cache_dir=None):
+def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, cache_dir=None,
+                   instance_weights=None):
     """Combine already world-posed candidates. All human checks use the full source grid."""
     if type(max_combinations) is not int or max_combinations < 1:
         raise ValueError("Scene combination budget must be a positive integer")
@@ -552,7 +556,8 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
         dirs[instance], seals[instance] = root, seal["candidates"]
         fit = read(root / "fit_result.json")
         candidates = fit["candidates"]
-        pool = sorted((c for c in candidates if eligible(c)), key=lambda c: (c["loss"], c["id"]))
+        from .priority import candidate_key, ranked_combinations
+        pool = sorted((c for c in candidates if eligible(c)), key=lambda c: (candidate_key(c), c["id"]))
         if not pool:
             failures = {c["id"]: c.get("rejection_reasons", []) for c in candidates}
             states = {
@@ -577,8 +582,8 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
         return report
     impl = {
         name: sha256(Path(__file__).parent / name)
-        for name in ("multi_scene.py", "collision.py", "geometry_audit.py", "engine.py", "policy.py",
-                     "query_backend.py", "runtime.py")
+        for name in ("multi_scene.py", "collision.py", "geometry_audit.py", "engine.py", "policy.py", "seating.py",
+                     "query_backend.py", "runtime.py", "priority.py", "collision_sampling.py")
     }
     impl.update(
         numpy=np.__version__, scipy=scipy.__version__, trimesh=trimesh.__version__, open3d=o3d.__version__,
@@ -587,8 +592,18 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
     )
     loaded, pairs = {}, {}
     keys = sorted(dirs)
+    weights = None
+    if instance_weights is not None:
+        weights = [float(instance_weights[k]) for k in keys]
+        total_weight = math.fsum(weights)
+        weights = [w / total_weight for w in weights] if total_weight else weights
+        report["ranking"] = dict(method="support_sample_weighted_loss", instance_weights=instance_weights)
     report["total_combinations"] = math.prod(len(rows) for rows in ordered)
-    for score, indices in ranked_choices(ordered):
+    use_priority=bool(ordered) and all("priority_score" in c for pool in ordered for c in pool)
+    if use_priority:
+        report["ranking"]=dict(method="collision_first",instance_weights=instance_weights)
+    combinations_iterator=ranked_combinations(ordered,weights or [1./len(ordered)]*len(ordered)) if use_priority else ranked_choices(ordered,weights)
+    for score, indices in combinations_iterator:
         if len(report["attempts"]) >= max_combinations:
             report.update(status="search_budget_exhausted", rejection_reasons=["search_budget_exhausted"])
             break
@@ -663,6 +678,7 @@ def assemble_scene(ctx, fit_dirs, output, max_combinations=64, input_key=None, c
                         instance_id=k,
                         candidate_id=c["id"],
                         loss=c["loss"],
+                        **({"priority_score":c["priority_score"]} if "priority_score" in c else {}),
                         transform=c["transform"],
                         mesh=Path(os.path.relpath(inside(dirs[k], c["mesh"]), output)).as_posix(),
                         parts=Path(os.path.relpath(inside(dirs[k], c["parts"]), output)).as_posix(),

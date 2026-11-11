@@ -9,6 +9,10 @@ import numpy as np
 import warp as wp
 from .runtime import current_profile
 
+# Candidate workers are processes; queries within one worker are synchronous.
+# Share immutable samples and scratch across streamed body frames, not meshes.
+_collision_workspaces = OrderedDict()
+
 
 @wp.kernel
 def _distance(mesh: wp.uint64, points: wp.array(dtype=wp.vec3), signed: int,
@@ -68,6 +72,46 @@ def _seat(mesh: wp.uint64, points: wp.array(dtype=wp.vec3), rotation: wp.mat33,
         valid[i] = 0
 
 
+@wp.kernel
+def _collision_depth(mesh: wp.uint64, points: wp.array(dtype=wp.vec3), r: wp.mat33,
+                     t: wp.vec3, s: float, lo: wp.vec3, hi: wp.vec3, depth: wp.array(dtype=float)):
+    i=wp.tid()
+    p=r*points[i]*s+t
+    depth[i]=0.0
+    if p[0]>=lo[0]-1.e-6 and p[1]>=lo[1]-1.e-6 and p[2]>=lo[2]-1.e-6 and p[0]<=hi[0]+1.e-6 and p[1]<=hi[1]+1.e-6 and p[2]<=hi[2]+1.e-6:
+        q=wp.mesh_query_point_sign_winding_number(mesh,p,1.e30)
+        if q.result:
+            depth[i]=wp.max(0.0,-wp.length(wp.mesh_eval_position(mesh,q.face,q.u,q.v)-p)*q.sign)
+        else:
+            depth[i]=wp.nan
+
+@wp.kernel
+def _collision_reduce(depth: wp.array(dtype=float), weights: wp.array(dtype=wp.float64), n: int,
+                      partial: wp.array2d(dtype=wp.float64)):
+    b=wp.tid()
+    maximum=wp.float64(0.0); squared=wp.float64(0.0); area=wp.float64(0.0)
+    index=wp.float64(-1.0); invalid=wp.float64(0.0)
+    for j in range(256):
+        i=b*256+j
+        if i<n:
+            d=wp.float64(depth[i])
+            if not wp.isfinite(d): invalid+=wp.float64(1.0)
+            else:
+                if d>maximum: maximum=d; index=wp.float64(i)
+                squared+=weights[i]*d*d
+                if d>wp.float64(0.0): area+=weights[i]
+    partial[b,0]=maximum; partial[b,1]=squared; partial[b,2]=area
+    partial[b,3]=index; partial[b,4]=invalid
+
+@wp.kernel
+def _collision_finish(partial: wp.array2d(dtype=wp.float64), n: int, result: wp.array(dtype=wp.float64)):
+    maximum=wp.float64(0.0); squared=wp.float64(0.0); area=wp.float64(0.0)
+    index=wp.float64(-1.0); invalid=wp.float64(0.0)
+    for i in range(n):
+        if partial[i,0]>maximum: maximum=partial[i,0]; index=partial[i,3]
+        squared+=partial[i,1]; area+=partial[i,2]; invalid+=partial[i,4]
+    result[0]=maximum; result[1]=squared; result[2]=area; result[3]=index; result[4]=invalid
+
 class ArrayResult:
     def __init__(self, value):
         self.value = value
@@ -86,6 +130,38 @@ class WarpScene:
         self.indices = wp.array(np.asarray(faces, np.int32).reshape(-1), dtype=wp.int32, device=self.device)
         self.mesh = wp.Mesh(points=self.vertices, indices=self.indices, support_winding_number=True)
         self._points = OrderedDict()
+        self.bounds = np.stack((np.min(vertices,axis=0),np.max(vertices,axis=0)))
+
+    def collision_summary(self, samples, rotation, translation, scale):
+        """Resident sampling with deterministic FP64 reductions; five scalars return."""
+        def run():
+            key=(str(self.device),samples.token)
+            if key not in _collision_workspaces:
+                n=len(samples.points); blocks=(n+255)//256
+                if len(_collision_workspaces)>=2: _collision_workspaces.popitem(last=False)
+                _collision_workspaces[key]=(wp.array(samples.points,dtype=wp.vec3,device=self.device),
+                    wp.array(samples.weights,dtype=wp.float64,device=self.device),
+                    wp.empty(n,dtype=float,device=self.device),
+                    wp.empty((blocks,5),dtype=wp.float64,device=self.device),
+                    wp.empty(5,dtype=wp.float64,device=self.device))
+                profile=self.profile if self.profile is not None else current_profile()
+                if profile is not None: profile.count("query.hybrid.upload_bytes",samples.points.nbytes+samples.weights.nbytes)
+            _collision_workspaces.move_to_end(key)
+            p,w,d,partial,result=_collision_workspaces[key]
+            r,t,s=self._transform(rotation,translation,scale)
+            wp.launch(_collision_depth,dim=len(samples.points),inputs=[self.mesh.id,p,r,t,s,
+                wp.vec3(*self.bounds[0]),wp.vec3(*self.bounds[1])],outputs=[d],device=self.device)
+            wp.launch(_collision_reduce,dim=partial.shape[0],inputs=[d,w,len(samples.points)],outputs=[partial],device=self.device)
+            wp.launch(_collision_finish,dim=1,inputs=[partial,partial.shape[0]],outputs=[result],device=self.device)
+            values=result.numpy()
+            profile=self.profile if self.profile is not None else current_profile()
+            if profile is not None: profile.count("query.hybrid.return_bytes",values.nbytes)
+            if values[4] or not np.isfinite(values).all(): raise RuntimeError("Invalid hybrid collision evidence")
+            total=float(samples.weights.sum())
+            return dict(depth=float(values[0]),rms=float(np.sqrt(values[1]/total)) if total else 0.,
+                squared_sum=float(values[1])*scale**2,penetrating_area=float(values[2])*scale**2,
+                total_area=total*scale**2,worst_index=int(values[3]),invalid_count=int(values[4]))
+        return self._run("collision_summary",samples.points,run)
 
     def _resident(self, points):
         points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
@@ -115,6 +191,8 @@ class WarpScene:
             wp.launch(_pose, dim=len(points), inputs=[source, r, t, s, int(inverse)], outputs=[posed], device=self.device)
             wp.launch(_distance, dim=len(points), inputs=[self.mesh.id, posed, int(signed)], outputs=[distance], device=self.device)
             values = distance.numpy()
+            profile=self.profile if self.profile is not None else current_profile()
+            if profile is not None: profile.count("query.warp.return_bytes",values.nbytes)
             if not np.isfinite(values).all():
                 raise RuntimeError("Warp transformed distance query returned an invalid result")
             return ArrayResult(values)
